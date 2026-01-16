@@ -6,20 +6,17 @@ Behavior:
 - By default runs in TEST_MODE and downloads only a limited number of files
   (e.g. 50) so you can confirm it works.
 - You can later set TEST_MODE = False to let it run through all pages.
+- File downloads are done in parallel using a thread pool.
 
 Requirements:
     pip install requests
-
-IMPORTANT:
-- Insert your own API key below.
-- Please be considerate and keep a delay between requests.
 """
 
 import os
 import time
-import json
 import logging
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -32,22 +29,24 @@ API_KEY = "66f02b95425dfb139e5accc3c43c9f83e78f73cf"  # <-- put your real key he
 API_URL = "https://xeno-canto.org/api/3/recordings"
 
 # Query: all recordings with length < 10 seconds
-# You can add more tags here if you want to restrict by group, country, etc.
 QUERY = 'len:"<10"'
 
 # Directory where audio files will be saved
 OUTPUT_DIR = Path("downloads")
 
-# Politeness settings
-REQUEST_SLEEP_SEC = 1.0  # pause between API calls
-DOWNLOAD_SLEEP_SEC = 0.05  # pause between file downloads
+# Politeness / rate control
+REQUEST_SLEEP_SEC = 1.0      # pause between API page requests
+DOWNLOAD_SLEEP_SEC = 0.1     # pause between file downloads (per thread)
+
+# Thread pool size for parallel downloads
+DOWNLOAD_THREADS = 10       # you can increase/decrease this
 
 # Test mode: only download a limited number of recordings
 TEST_MODE = True
-TEST_MAX_DOWNLOADS = 3   # "a few dozen"
+TEST_MAX_DOWNLOADS = 20      # "a few dozen"
 
-# In full mode, you can optionally set a hard upper bound as a safety
-FULL_MAX_DOWNLOADS = None  # or e.g. 10000
+# In full mode, optional hard upper bound as a safety
+FULL_MAX_DOWNLOADS = None    # or e.g. 10000
 
 # Per-page size (between 50 and 500 according to API docs)
 PER_PAGE = 500
@@ -97,18 +96,38 @@ def safe_filename(rec: dict) -> str:
     return f"XC{xc_id}{ext}"
 
 
-def download_file(url: str, dest_path: Path, session: requests.Session) -> bool:
-    """Download a file with streaming, return True on success."""
+def download_one(recording: dict) -> bool:
+    """
+    Worker function: download a single recording.
+    Returns True on success, False on failure or if skipped.
+    """
+    file_field = recording.get("file")
+    if not file_field:
+        return False
+
+    url = normalize_file_url(file_field)
+    filename = safe_filename(recording)
+    dest = OUTPUT_DIR / filename
+
+    if dest.exists():
+        logging.info(f"[SKIP] Already exists: {dest.name}")
+        return False
+
+    xc_id = recording.get("id")
+    logging.info(f"[DL] XC{xc_id} -> {dest.name}")
+
     try:
-        with session.get(url, stream=True, timeout=60) as r:
+        # Use a separate session/request per thread for safety
+        with requests.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
-            with open(dest_path, "wb") as f:
+            with open(dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
+        time.sleep(DOWNLOAD_SLEEP_SEC)
         return True
     except Exception as e:
-        logging.warning(f"Failed to download {url}: {e}")
+        logging.warning(f"[ERR] Failed to download {url}: {e}")
         return False
 
 
@@ -148,59 +167,78 @@ def main():
 
     downloaded = 0
 
-    # Process first page (already fetched), then loop through the rest
-    while True:
-        logging.info(f"Processing page {page}/{num_pages}...")
-        recordings = data.get("recordings", [])
-        logging.info(f"  {len(recordings)} recordings on this page.")
+    # Thread pool for downloads
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as executor:
+        # Process first page (already fetched), then loop through the rest
+        while True:
+            logging.info(f"Processing page {page}/{num_pages}...")
+            recordings = data.get("recordings", [])
+            logging.info(f"  {len(recordings)} recordings on this page.")
 
-        for rec in recordings:
+            # Build a list of recordings to download from this page,
+            # skipping ones already present and capping at remaining slots.
+            to_download = []
+            remaining_slots = max_downloads - downloaded
+            if remaining_slots <= 0:
+                logging.info(
+                    f"Reached download limit ({max_downloads}). Stopping."
+                )
+                break
+
+            for rec in recordings:
+                if len(to_download) >= remaining_slots:
+                    break
+
+                file_field = rec.get("file")
+                if not file_field:
+                    continue
+
+                filename = safe_filename(rec)
+                dest = OUTPUT_DIR / filename
+                if dest.exists():
+                    continue  # will be logged as [SKIP] inside download_one if re-checked, but we skip work here
+
+                to_download.append(rec)
+
+            if not to_download:
+                logging.info("  Nothing new to download on this page.")
+            else:
+                logging.info(
+                    f"  Submitting {len(to_download)} downloads to thread pool "
+                    f"(threads={DOWNLOAD_THREADS})..."
+                )
+
+                futures = [executor.submit(download_one, rec) for rec in to_download]
+
+                # Collect results
+                for fut in as_completed(futures):
+                    if fut.result():
+                        downloaded += 1
+
+                logging.info(f"  Downloads so far: {downloaded}")
+
+            # Check if we've hit the global limit
             if downloaded >= max_downloads:
                 logging.info(
                     f"Reached download limit ({max_downloads}). Stopping."
                 )
-                return
+                break
 
-            file_field = rec.get("file")
-            if not file_field:
-                continue
+            # Next page?
+            page += 1
+            if page > num_pages:
+                logging.info("No more pages left.")
+                break
 
-            url = normalize_file_url(file_field)
-            filename = safe_filename(rec)
-            dest = OUTPUT_DIR / filename
+            time.sleep(REQUEST_SLEEP_SEC)
 
-            if dest.exists():
-                logging.info(f"Already exists, skipping: {dest}")
-                continue
+            params = build_api_params(page)
+            logging.info(f"Requesting page {page}...")
+            resp = session.get(API_URL, params=params, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
 
-            logging.info(f"Downloading XC{rec.get('id')} -> {dest.name}")
-            success = download_file(url, dest, session)
-            if success:
-                downloaded += 1
-            time.sleep(DOWNLOAD_SLEEP_SEC)
-
-        # Stop early in test mode if we already hit limit during this page
-        if downloaded >= max_downloads:
-            logging.info(
-                f"Reached download limit ({max_downloads}). Stopping."
-            )
-            break
-
-        # Next page?
-        page += 1
-        if page > num_pages:
-            logging.info("No more pages left.")
-            break
-
-        time.sleep(REQUEST_SLEEP_SEC)
-
-        params = build_api_params(page)
-        logging.info(f"Requesting page {page}...")
-        resp = session.get(API_URL, params=params, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-
-    logging.info(f"Finished. Total downloaded: {downloaded}")
+    logging.info(f"Finished. Total successfully downloaded: {downloaded}")
 
 
 if __name__ == "__main__":
