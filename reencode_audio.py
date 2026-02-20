@@ -141,6 +141,7 @@ class AudioReencoder:
             cmd = [
                 'ffmpeg',
                 '-i', str(file_path),
+                '-map_metadata', '0',  # Copy all metadata from input
                 '-ar', str(self.sample_rate),
                 '-ac', '1',  # Mono
                 '-f', 'wav',  # Explicitly specify WAV format
