@@ -30,7 +30,7 @@ API_URL = "https://xeno-canto.org/api/3/recordings"
 
 # Query: all recordings with length < 10 seconds
 QUERY = 'len:"<15"'
-QUERY = 'len:"<10" q:">C"'
+QUERY = 'len:"<60" q:">D"'
 
 # Directory where audio files will be saved
 OUTPUT_DIR = Path("test_AB")
