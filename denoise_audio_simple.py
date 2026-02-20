@@ -319,7 +319,7 @@ class SimpleAudioDenoiser:
                 # Save each segment as a separate file
                 for i, (start, end) in enumerate(segments):
                     segment_stem = f"{file_path.stem}-segment{i:03d}"
-                    segment_path = f"{file_path.parent}/segments/" + f"{segment_stem}.{self.output_format}"
+                    segment_path = file_path.parent / f"{segment_stem}.{self.output_format}"
 
                     # Trim to actual audio length
                     end = min(end, len(audio))
