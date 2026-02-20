@@ -531,7 +531,7 @@ Examples:
     segment_group.add_argument(
         '--min-segment-duration',
         type=float,
-        default=0.1,
+        default=0.3,
         help='Minimum segment duration in seconds (default: 0.1)'
     )
 
