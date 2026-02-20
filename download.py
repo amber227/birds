@@ -29,17 +29,18 @@ API_KEY = "66f02b95425dfb139e5accc3c43c9f83e78f73cf"  # <-- put your real key he
 API_URL = "https://xeno-canto.org/api/3/recordings"
 
 # Query: all recordings with length < 10 seconds
-QUERY = 'len:"<10"'
+QUERY = 'len:"<15"'
+QUERY = 'len:"<10" q:">C"'
 
 # Directory where audio files will be saved
-OUTPUT_DIR = Path("downloads")
+OUTPUT_DIR = Path("test_AB")
 
 # Politeness / rate control
 REQUEST_SLEEP_SEC = 1.0      # pause between API page requests
-DOWNLOAD_SLEEP_SEC = 0.1     # pause between file downloads (per thread)
+DOWNLOAD_SLEEP_SEC = 0.05     # pause between file downloads (per thread)
 
 # Thread pool size for parallel downloads
-DOWNLOAD_THREADS = 10       # you can increase/decrease this
+DOWNLOAD_THREADS = 5        # you can increase/decrease this
 
 # Test mode: only download a limited number of recordings
 TEST_MODE = True
