@@ -44,13 +44,14 @@ class MLAudioDenoiser:
     def __init__(
         self,
         directory: Path,
-        model_name: str = 'DeepFilterNet3',
+        model_name: str = 'DeepFilterNet',
         num_workers: int = 1,  # DeepFilterNet is GPU-intensive, default to 1
         progress_file: str = '.denoise_ml_progress.json',
         output_format: str = 'wav',
         sample_rate: int = None,
         skip_existing: bool = True,
         use_gpu: bool = True,
+        post_filter: bool = False,
         dry_run: bool = False,
         verbose: bool = False,
         use_existing_progress: bool = True
@@ -62,6 +63,7 @@ class MLAudioDenoiser:
         self.output_format = output_format
         self.sample_rate = sample_rate
         self.skip_existing = skip_existing
+        self.post_filter = post_filter
         self.dry_run = dry_run
         self.verbose = verbose
         self.use_existing_progress = use_existing_progress
@@ -89,10 +91,11 @@ class MLAudioDenoiser:
         # Load model (done once, reused across all files)
         if not self.dry_run:
             self.logger.info(f"Loading {model_name} model...")
+            self.logger.info(f"Post-filter: {'enabled' if post_filter else 'disabled (faster)'}")
             try:
                 self.model, self.df_state, _ = init_df(
                     model_base_dir=model_name,
-                    post_filter=True
+                    post_filter=post_filter
                 )
                 self.logger.info("Model loaded successfully")
             except Exception as e:
@@ -284,9 +287,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 DeepFilterNet Models:
-  - DeepFilterNet3 (default): Latest model, best quality
-  - DeepFilterNet2: Previous version, faster
-  - DeepFilterNet: Original version
+  - DeepFilterNet3 (default): Latest model, best quality, slowest
+  - DeepFilterNet2: Previous version, faster, good quality
+  - DeepFilterNet: Original version, fastest, lower quality
+
+Speed vs Quality Tradeoffs:
+  For faster processing (sacrifice some quality):
+  1. Use older model: --model DeepFilterNet (fastest)
+  2. Disable post-filter: --no-post-filter (~30% faster)
+  3. Use both: --model DeepFilterNet --no-post-filter (2-3x faster)
 
 Installation:
   pip install deepfilternet
@@ -295,7 +304,7 @@ Installation:
 
 Examples:
   %(prog)s /path/to/audio
-  %(prog)s /path/to/audio --model DeepFilterNet2
+  %(prog)s /path/to/audio --model DeepFilterNet --no-post-filter  # Fast
   %(prog)s /path/to/audio --sample-rate 24000
   %(prog)s /path/to/audio --no-gpu --dry-run
         """
@@ -322,6 +331,12 @@ Examples:
         '--no-gpu',
         action='store_true',
         help='Force CPU processing (default: use GPU if available)'
+    )
+
+    model_group.add_argument(
+        '--no-post-filter',
+        action='store_true',
+        help='Disable post-filter for faster processing (~30%% speed boost, slight quality loss)'
     )
 
     # Output options
@@ -448,6 +463,7 @@ Examples:
             sample_rate=args.sample_rate,
             skip_existing=not args.overwrite,
             use_gpu=not args.no_gpu,
+            post_filter=not args.no_post_filter,
             dry_run=args.dry_run,
             verbose=args.verbose,
             use_existing_progress=use_existing_progress
