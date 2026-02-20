@@ -319,7 +319,7 @@ class SimpleAudioDenoiser:
                 # Save each segment as a separate file
                 for i, (start, end) in enumerate(segments):
                     segment_stem = f"{file_path.stem}-segment{i:03d}"
-                    segment_path = file_path.parent / f"{segment_stem}.{self.output_format}"
+                    segment_path = f"{file_path.parent}/segments" / f"{segment_stem}.{self.output_format}"
 
                     # Trim to actual audio length
                     end = min(end, len(audio))
@@ -328,14 +328,14 @@ class SimpleAudioDenoiser:
                     self.logger.debug(f"Saved segment {i}: {segment_path.name}")
 
                 # Also save the full denoised version with chunks zeroed out
-                denoised = np.copy(audio)
-                num_chunks = len(chunk_mask)
-                for i, keep_chunk in enumerate(chunk_mask):
-                    if not keep_chunk:
-                        start = i * chunk_size
-                        end = min((i + 1) * chunk_size, len(audio))
-                        denoised[start:end] = 0.0
-                sf.write(str(output_path), denoised, sr, format=self.output_format.upper())
+                # denoised = np.copy(audio)
+                # num_chunks = len(chunk_mask)
+                # for i, keep_chunk in enumerate(chunk_mask):
+                #     if not keep_chunk:
+                #         start = i * chunk_size
+                #         end = min((i + 1) * chunk_size, len(audio))
+                #         denoised[start:end] = 0.0
+                # sf.write(str(output_path), denoised, sr, format=self.output_format.upper())
             else:
                 # Zero out entire chunks below threshold
                 denoised = np.copy(audio)
