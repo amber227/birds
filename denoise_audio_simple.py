@@ -492,7 +492,7 @@ Examples:
     threshold_group.add_argument(
         '--std-multiplier', '-s',
         type=float,
-        default=0.0,
+        default=0.25,
         dest='threshold_std',
         help='Standard deviation multiplier for threshold (default: 0.0, just mean)'
     )
@@ -507,14 +507,14 @@ Examples:
     threshold_group.add_argument(
         '--chunk-duration', '-c',
         type=float,
-        default=0.01,
+        default=0.05,
         help='Duration of each chunk in seconds (default: 0.01)'
     )
 
     threshold_group.add_argument(
         '--padding-chunks', '-p',
         type=int,
-        default=0,
+        default=5,
         dest='padding_chunks',
         help='Number of chunks to keep on either side of loud chunks (default: 0)'
     )
@@ -570,7 +570,7 @@ Examples:
     )
 
     process_group.add_argument(
-        '--progress-file', '-p',
+        '--progress-file',
         type=str,
         default='.denoise_simple_progress.json',
         help='Progress tracking file name (default: .denoise_simple_progress.json)'
