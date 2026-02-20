@@ -44,7 +44,7 @@ class MLAudioDenoiser:
     def __init__(
         self,
         directory: Path,
-        model_name: str = 'DeepFilterNet',
+        model_name: str = 'DeepFilterNet2',
         num_workers: int = 1,  # DeepFilterNet is GPU-intensive, default to 1
         progress_file: str = '.denoise_ml_progress.json',
         output_format: str = 'wav',
