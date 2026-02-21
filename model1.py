@@ -15,6 +15,11 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
+import warnings
+
+# Option A: silence all torchaudio UserWarnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+
 # ============================================================
 # Denoise + segmentation core (ported from SimpleAudioDenoiser)
 # ============================================================
