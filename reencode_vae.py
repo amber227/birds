@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+"""
+python reencode_vae.py \
+  --checkpoint vae_latent128_epoch10.pt \
+  --input "test_segments/*.wav" \
+  --sample_rate 16000
+"""
+
+#/usr/bin/env python3
 import argparse
 import glob
 from pathlib import Path
