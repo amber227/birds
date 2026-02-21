@@ -5,16 +5,19 @@ import math
 import argparse
 import signal
 import sys
+import threading
+import queue
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import torchaudio
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
@@ -109,16 +112,10 @@ class SegmentInfo:
 # Dataset: denoise+segment on-the-fly, then log-mel
 # ============================================================
 
-class SegmentedAudioDataset(Dataset):
+class StreamingSegmentedAudioDataset(IterableDataset):
     """
-    Dataset that:
-      - Finds all audio files under root_dir.
-      - For each file, runs the denoise+segment logic in memory to find
-        "loud" segments.
-      - Each item is one segment: cropped/padded to fixed duration, then
-        converted to log-mel.
-
-    No intermediate files are written.
+    Streaming dataset that processes audio files in parallel with training.
+    Uses a background thread to continuously find and queue segments.
     """
 
     def __init__(
@@ -131,12 +128,15 @@ class SegmentedAudioDataset(Dataset):
         hop_length: int = 256,
         f_min: float = 0.0,
         f_max: float = None,
-        # denoise/segment params (mirror your script)
+        # denoise/segment params
         threshold_std: float = 0.25,
         use_mean: bool = True,
         chunk_duration: float = 0.05,
         padding_chunks: int = 5,
         min_segment_duration: float = 0.3,
+        # streaming params
+        queue_size: int = 1000,
+        min_queue_size: int = 100,
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -164,14 +164,20 @@ class SegmentedAudioDataset(Dataset):
         self.padding_chunks = padding_chunks
         self.min_segment_duration = min_segment_duration
 
-        # build segment index
-        self.segments: List[SegmentInfo] = []
-        self._build_index()
-
-        if len(self.segments) == 0:
-            raise RuntimeError(f"No segments found under {root_dir} with current settings")
-
-        print(f"Indexed {len(self.segments)} segments from audio in {root_dir}")
+        # streaming setup
+        self.queue_size = queue_size
+        self.min_queue_size = min_queue_size
+        self.segment_queue = queue.Queue(maxsize=queue_size)
+        self.processing_complete = threading.Event()
+        self.stop_processing = threading.Event()
+        
+        # stats
+        self.total_segments_found = 0
+        self.total_files_processed = 0
+        self.total_files = 0
+        
+        # start background processing
+        self._start_processing()
 
     def _find_audio_files(self) -> List[Path]:
         audio_files: List[Path] = []
@@ -192,13 +198,22 @@ class SegmentedAudioDataset(Dataset):
         audio = wav.squeeze(0).cpu().numpy().astype(np.float32)
         return audio, sr
 
-    def _build_index(self):
-        print(f"Scanning and segmenting audio under {self.root_dir} ...")
+    def _process_files_worker(self):
+        """Background worker that processes files and adds segments to queue"""
+        print(f"Starting background processing of audio files in {self.root_dir}")
         files = self._find_audio_files()
         if not files:
-            raise RuntimeError(f"No audio files found under {self.root_dir}")
+            print(f"No audio files found under {self.root_dir}")
+            self.processing_complete.set()
+            return
+            
+        self.total_files = len(files)
+        print(f"Found {self.total_files} audio files to process")
 
         for i, path in enumerate(files, 1):
+            if self.stop_processing.is_set():
+                break
+                
             try:
                 audio, sr = self._load_mono_resampled(path)
                 if len(audio) == 0:
@@ -223,26 +238,61 @@ class SegmentedAudioDataset(Dataset):
                     self.min_segment_duration,
                 )
 
+                file_segments = 0
                 for (start, end) in segs:
+                    if self.stop_processing.is_set():
+                        break
+                        
                     end = min(end, len(audio))
                     if end <= start:
                         continue
-                    self.segments.append(
-                        SegmentInfo(
-                            file_path=path,
-                            start_sample=int(start),
-                            end_sample=int(end),
-                            sr=sr,
-                        )
+                        
+                    seg_info = SegmentInfo(
+                        file_path=path,
+                        start_sample=int(start),
+                        end_sample=int(end),
+                        sr=sr,
                     )
+                    
+                    # Block if queue is full
+                    while not self.stop_processing.is_set():
+                        try:
+                            self.segment_queue.put(seg_info, timeout=1.0)
+                            file_segments += 1
+                            self.total_segments_found += 1
+                            break
+                        except queue.Full:
+                            continue
 
-                if i % 100 == 0 or i == len(files):
-                    print(f"  Processed {i}/{len(files)} files, segments so far: {len(self.segments)}")
+                self.total_files_processed += 1
+                if i % 10 == 0 or i == len(files):
+                    print(f"  Processed {i}/{len(files)} files, "
+                          f"segments found: {self.total_segments_found}, "
+                          f"queue size: {self.segment_queue.qsize()}")
+                    
             except Exception as e:
                 print(f"Error processing {path}: {e}")
 
-    def __len__(self):
-        return len(self.segments)
+        print(f"Background processing complete. Total segments found: {self.total_segments_found}")
+        self.processing_complete.set()
+
+    def _start_processing(self):
+        """Start the background processing thread"""
+        self.processing_thread = threading.Thread(target=self._process_files_worker, daemon=True)
+        self.processing_thread.start()
+        
+        # Wait for initial segments to be available
+        print("Waiting for initial segments to be processed...")
+        while (self.segment_queue.qsize() < self.min_queue_size and 
+               not self.processing_complete.is_set()):
+            time.sleep(0.1)
+        
+        if self.segment_queue.qsize() > 0:
+            print(f"Ready to start training with {self.segment_queue.qsize()} segments queued")
+        elif self.processing_complete.is_set():
+            if self.total_segments_found == 0:
+                raise RuntimeError(f"No segments found under {self.root_dir} with current settings")
+            print(f"Processing complete with {self.total_segments_found} total segments")
 
     def _extract_segment_waveform(self, seg: SegmentInfo) -> torch.Tensor:
         # reload audio for this file (we don't keep full audio in RAM)
@@ -267,18 +317,46 @@ class SegmentedAudioDataset(Dataset):
         wav = torch.from_numpy(segment).unsqueeze(0)  # (1, T)
         return wav
 
-    def __getitem__(self, idx):
-        seg = self.segments[idx]
-        wav = self._extract_segment_waveform(seg)  # (1, T)
+    def __iter__(self):
+        """Iterate over segments as they become available"""
+        segments_yielded = 0
+        
+        while True:
+            try:
+                # Try to get a segment from the queue
+                seg = self.segment_queue.get(timeout=1.0)
+                
+                # Process the segment
+                wav = self._extract_segment_waveform(seg)  # (1, T)
+                
+                with torch.no_grad():
+                    mel = self.mel(wav)  # (1, n_mels, T_frames)
+                    log_mel = self.to_db(mel + 1e-6)
+                # per-sample normalization
+                mean = log_mel.mean()
+                std = log_mel.std() + 1e-8
+                log_mel = (log_mel - mean) / std
+                
+                segments_yielded += 1
+                yield log_mel  # (1, n_mels, T_frames)
+                
+            except queue.Empty:
+                # Check if processing is complete and queue is empty
+                if self.processing_complete.is_set() and self.segment_queue.empty():
+                    print(f"Finished iterating over all segments. Total yielded: {segments_yielded}")
+                    break
+                # Otherwise continue waiting for more segments
+                continue
+                
+    def stop(self):
+        """Stop the background processing"""
+        self.stop_processing.set()
+        if hasattr(self, 'processing_thread'):
+            self.processing_thread.join(timeout=5.0)
 
-        with torch.no_grad():
-            mel = self.mel(wav)  # (1, n_mels, T_frames)
-            log_mel = self.to_db(mel + 1e-6)
-        # per-sample normalization
-        mean = log_mel.mean()
-        std = log_mel.std() + 1e-8
-        log_mel = (log_mel - mean) / std
-        return log_mel  # (1, n_mels, T_frames)
+    def __del__(self):
+        """Cleanup when dataset is destroyed"""
+        self.stop()
 
 
 # ============================================================
@@ -536,7 +614,7 @@ def train(
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
 
-    dataset = SegmentedAudioDataset(
+    dataset = StreamingSegmentedAudioDataset(
         root_dir=data_dir,
         sample_rate=sample_rate,
         target_duration_sec=duration_sec,
@@ -551,15 +629,40 @@ def train(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
+        shuffle=False,  # Can't shuffle streaming dataset
+        num_workers=0,   # Must be 0 for IterableDataset with threading
         pin_memory=True,
         drop_last=True,
     )
 
-    x0 = next(iter(dataloader))
+    # Get example batch to determine shape
+    print("Getting example batch to determine input shape...")
+    dataloader_iter = iter(dataloader)
+    x0 = next(dataloader_iter)
     print(f"Example batch shape (log-mel): {x0.shape}")
     B, C, H, W = x0.shape
+    
+    # Create a fresh dataloader for training
+    dataset = StreamingSegmentedAudioDataset(
+        root_dir=data_dir,
+        sample_rate=sample_rate,
+        target_duration_sec=duration_sec,
+        n_mels=n_mels,
+        threshold_std=threshold_std,
+        use_mean=use_mean,
+        chunk_duration=chunk_duration,
+        padding_chunks=padding_chunks,
+        min_segment_duration=min_segment_duration,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=True,
+    )
 
     model = ConvVAE(in_channels=C, latent_dim=latent_dim, beta=beta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
