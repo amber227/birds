@@ -176,10 +176,12 @@ def prepare_transforms(sample_rate: int, n_mels: int, n_fft: int, hop_length: in
     ).to(device)
     to_db = AmplitudeToDB(stype="power").to(device)
 
-    # Get mel filterbank (n_mels, n_stft)
-    fb = mel.mel_scale.fb.to(device)          # (n_mels, n_stft)
-    # Precompute pseudo-inverse: (n_stft, n_mels)
-    fb_pinv = torch.linalg.pinv(fb)           # (n_stft, n_mels)
+    # mel.mel_scale.fb has shape (n_stft, n_mels)
+    fb = mel.mel_scale.fb.to(device)      # (n_stft, n_mels)
+    fb_T = fb.T                           # (n_mels, n_stft)
+
+    # Pseudo-inverse of (n_mels, n_stft) -> (n_stft, n_mels)
+    fb_pinv = torch.linalg.pinv(fb_T)     # (n_stft, n_mels)
 
     griffin = GriffinLim(
         n_fft=n_fft,
