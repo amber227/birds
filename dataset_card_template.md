@@ -28,10 +28,16 @@ example = dataset["train"][0]
 audio = example["audio"]
 xc_id = example["xc_id"]
 
-# Audio format
+# If audio was uploaded with decoding:
 print(audio.keys())  # dict_keys(['path', 'array', 'sampling_rate'])
 print(f"Sample rate: {audio['sampling_rate']}")
 print(f"Audio array shape: {audio['array'].shape}")
+
+# If audio was uploaded without decoding (--no-decode):
+# The audio field contains file paths - you need to load them manually
+import torchaudio
+audio_path = example["audio"]
+waveform, sample_rate = torchaudio.load(audio_path)
 ```
 
 ### License

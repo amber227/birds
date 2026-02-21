@@ -4,8 +4,9 @@ Upload audio dataset to Hugging Face Hub.
 """
 import argparse
 from pathlib import Path
-from datasets import Dataset, Audio, Features, Value
+from datasets import Dataset, Audio, Features, Value, load_dataset
 from huggingface_hub import HfApi
+import os
 
 
 # Common audio file extensions
@@ -15,9 +16,46 @@ AUDIO_EXTENSIONS = {
 }
 
 
-def create_dataset_from_audio_dir(audio_dir: Path):
+def create_dataset_with_audiofolder(audio_dir: Path):
+    """
+    Create dataset using AudioFolder - efficient for large datasets, no FFmpeg needed during creation.
+    """
+    print(f"Using AudioFolder to load dataset from: {audio_dir}")
+    print("This method is efficient for large datasets and doesn't require FFmpeg during creation.")
+
+    # Temporarily set environment variable to avoid FFmpeg requirement
+    os.environ["HF_DATASETS_OFFLINE"] = "0"
+
+    # Load dataset using audiofolder
+    dataset = load_dataset("audiofolder", data_dir=str(audio_dir), split="train")
+
+    print(f"Dataset created with {len(dataset)} examples")
+    print(f"Columns: {dataset.column_names}")
+
+    # Add XC ID column
+    def add_xc_id(example):
+        file_name = Path(example["audio"]["path"]).stem
+        if file_name.startswith("XC"):
+            xc_id = file_name[2:]
+        else:
+            xc_id = file_name
+        example["xc_id"] = xc_id
+        example["file_name"] = Path(example["audio"]["path"]).name
+        return example
+
+    print("Adding metadata...")
+    dataset = dataset.map(add_xc_id)
+
+    return dataset
+
+
+def create_dataset_from_audio_dir(audio_dir: Path, decode_audio: bool = True):
     """
     Create a Hugging Face dataset from a directory of audio files.
+
+    Args:
+        audio_dir: Directory containing audio files
+        decode_audio: If False, store audio paths without decoding (faster, no FFmpeg needed)
     """
     print(f"Scanning directory: {audio_dir}")
 
@@ -46,7 +84,11 @@ def create_dataset_from_audio_dir(audio_dir: Path):
         "xc_id": [],
     }
 
-    for audio_file in audio_files:
+    print(f"\nProcessing {len(audio_files)} files...")
+    for i, audio_file in enumerate(audio_files):
+        if (i + 1) % 10000 == 0:
+            print(f"  Processed {i + 1}/{len(audio_files)} files...")
+
         data["audio"].append(str(audio_file))
         data["file_name"].append(audio_file.name)
 
@@ -58,15 +100,28 @@ def create_dataset_from_audio_dir(audio_dir: Path):
             xc_id = stem
         data["xc_id"].append(xc_id)
 
-    # Define features with Audio type
-    features = Features({
-        "audio": Audio(sampling_rate=None),  # Will preserve original sample rate
-        "file_name": Value("string"),
-        "xc_id": Value("string"),
-    })
-
     # Create dataset
-    dataset = Dataset.from_dict(data, features=features)
+    print("\nBuilding dataset...")
+    if decode_audio:
+        # Use Audio feature - requires FFmpeg but handles everything automatically
+        print("Using Audio feature (requires FFmpeg, audio files will be uploaded and decoded)...")
+        features = Features({
+            "audio": Audio(sampling_rate=None),
+            "file_name": Value("string"),
+            "xc_id": Value("string"),
+        })
+        dataset = Dataset.from_dict(data, features=features)
+    else:
+        # Store paths only - no FFmpeg needed, but audio files won't be uploaded
+        print("Storing file paths only (no FFmpeg needed)...")
+        print("WARNING: Audio files will NOT be uploaded to HuggingFace.")
+        print("         Users will need to download files separately.")
+        features = Features({
+            "audio": Value("string"),
+            "file_name": Value("string"),
+            "xc_id": Value("string"),
+        })
+        dataset = Dataset.from_dict(data, features=features)
 
     print(f"\nDataset created with {len(dataset)} examples")
     print(f"Columns: {dataset.column_names}")
@@ -101,20 +156,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Upload test_AB directory
+  # Upload test_AB directory (uses AudioFolder by default - efficient & no FFmpeg needed)
   python upload_to_hf.py test_AB --repo my-username/xeno-canto-test
 
   # Upload as private dataset
   python upload_to_hf.py test_AB --repo my-username/xeno-canto-test --private
 
-  # Specify token explicitly
-  python upload_to_hf.py test_AB --repo my-username/xeno-canto-test --token hf_xxxxx
+  # Dry run to test without uploading
+  python upload_to_hf.py test_AB --repo my-username/xeno-canto-test --dry-run
 
 Note:
   You need to be logged in to Hugging Face:
     huggingface-cli login
 
   Or provide a token with --token
+
+  The default AudioFolder method is efficient for large datasets (even 200k+ files)
+  and doesn't require FFmpeg during upload. Audio is decoded on-demand when loading.
 """
     )
 
@@ -150,6 +208,19 @@ Note:
         help="Create dataset but don't upload"
     )
 
+    parser.add_argument(
+        "--use-audiofolder",
+        action="store_true",
+        default=True,
+        help="Use AudioFolder method (default, efficient for large datasets, no FFmpeg needed during upload)"
+    )
+
+    parser.add_argument(
+        "--no-decode",
+        action="store_true",
+        help="[Legacy method] Don't decode audio files (stores paths only, files won't be uploaded)"
+    )
+
     args = parser.parse_args()
 
     audio_dir = Path(args.audio_dir)
@@ -164,9 +235,15 @@ Note:
 
     # Create dataset
     try:
-        dataset = create_dataset_from_audio_dir(audio_dir)
+        if args.use_audiofolder:
+            dataset = create_dataset_with_audiofolder(audio_dir)
+        else:
+            decode_audio = not args.no_decode
+            dataset = create_dataset_from_audio_dir(audio_dir, decode_audio=decode_audio)
     except Exception as e:
         print(f"Error creating dataset: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
     if args.dry_run:
