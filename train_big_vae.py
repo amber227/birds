@@ -19,7 +19,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 # ============================================================
-# DENOISE + SEGMENT CORE (from your SimpleAudioDenoiser, segment mode)
+# DENOISE + SEGMENT CORE (segment mode)
 # ============================================================
 
 AUDIO_EXTENSIONS = {
@@ -68,7 +68,7 @@ def find_segments(
     chunk_size: int,
     chunk_duration: float,
     min_segment_duration: float,
-) -> List[Tuple[int, int]]:
+):
     padded = np.pad(chunk_mask, (1, 1), mode='constant', constant_values=0)
     starts = np.where(np.diff(padded.astype(int)) == 1)[0]
     ends = np.where(np.diff(padded.astype(int)) == -1)[0]
@@ -97,11 +97,11 @@ class SegmentInfo:
 
 class SegmentedAudioDataset(Dataset):
     """
-    - Recursively finds audio files under root_dir.
-    - For each file, runs statistical denoise+segment in memory.
-    - Each dataset item is one (denoised) segment:
-        * cropped/padded to target_duration_sec
-        * converted to log-mel
+    Offline index of all segments, but no intermediate files:
+      - Finds all audio files under root_dir.
+      - For each: denoise+segment to build a list of (start,end).
+      - __getitem__ loads just that segment, crops/pads to fixed length,
+        and converts to log-mel.
     """
 
     def __init__(
@@ -125,7 +125,6 @@ class SegmentedAudioDataset(Dataset):
         self.sample_rate = sample_rate
         self.target_len = int(sample_rate * target_duration_sec)
 
-        # log-mel transforms
         self.mel = MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -139,23 +138,21 @@ class SegmentedAudioDataset(Dataset):
         )
         self.to_db = AmplitudeToDB(stype="power")
 
-        # denoise/segment params
         self.threshold_std = threshold_std
         self.use_mean = use_mean
         self.chunk_duration = chunk_duration
         self.padding_chunks = padding_chunks
         self.min_segment_duration = min_segment_duration
 
-        self.segments: List[SegmentInfo] = []
+        self.segments: list[SegmentInfo] = []
         self._build_index()
 
         if len(self.segments) == 0:
             raise RuntimeError(f"No segments found under {root_dir} with current settings")
-
         print(f"Indexed {len(self.segments)} segments from audio in {root_dir}")
 
-    def _find_audio_files(self) -> List[Path]:
-        audio_files: List[Path] = []
+    def _find_audio_files(self):
+        audio_files = []
         for root, dirs, files in os.walk(self.root_dir):
             for fname in files:
                 p = Path(root) / fname
@@ -163,7 +160,7 @@ class SegmentedAudioDataset(Dataset):
                     audio_files.append(p)
         return sorted(audio_files)
 
-    def _load_mono_resampled(self, path: Path) -> Tuple[np.ndarray, int]:
+    def _load_mono_resampled(self, path: Path):
         wav, sr = torchaudio.load(str(path))  # (C, T)
         if wav.size(0) > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
@@ -202,7 +199,6 @@ class SegmentedAudioDataset(Dataset):
                     self.chunk_duration,
                     self.min_segment_duration,
                 )
-
                 for start, end in segs:
                     end = min(end, len(audio))
                     if end <= start:
@@ -238,7 +234,6 @@ class SegmentedAudioDataset(Dataset):
         elif len(segment) < self.target_len:
             pad_len = self.target_len - len(segment)
             segment = np.pad(segment, (0, pad_len), mode="constant")
-
         return torch.from_numpy(segment).unsqueeze(0)  # (1, T)
 
     def __getitem__(self, idx):
@@ -256,7 +251,7 @@ class SegmentedAudioDataset(Dataset):
 
 
 # ============================================================
-# A BIGGER VAE (DEEPER, MORE CHANNELS, RESIDUAL BLOCKS)
+# BIGGER VAE (DEEPER, MORE CHANNELS, RESBLOCKS)
 # ============================================================
 
 class ResBlock2d(nn.Module):
@@ -286,7 +281,7 @@ class BigConvVAE(nn.Module):
     """
     Deeper and wider VAE:
       - Encoder: 5 downsampling stages, channels 64, 128, 256, 512, 512
-      - Each stage: Conv(stride=2) + 1–2 residual blocks
+      - Each stage: Conv(stride=2) + ResBlock
       - Latent dim: configurable
     """
 
@@ -328,7 +323,7 @@ class BigConvVAE(nn.Module):
                     out_ch,
                     kernel_size=4,
                     stride=2,
-                    padding=1,
+padding=1,
                     output_padding=0,
                 ),
                 nn.BatchNorm2d(out_ch),
@@ -353,7 +348,6 @@ class BigConvVAE(nn.Module):
             self.enc_H = H_enc
             self.enc_W = W_enc
             self.enc_out_dim = C_enc * H_enc * W_enc
-
             device = h.device
             self.fc_mu = nn.Linear(self.enc_out_dim, self.latent_dim).to(device)
             self.fc_logvar = nn.Linear(self.enc_out_dim, self.latent_dim).to(device)
@@ -372,14 +366,11 @@ class BigConvVAE(nn.Module):
     def decode(self, z, target_shape):
         B = z.size(0)
         H, W = target_shape[2], target_shape[3]
-
         h = self.decoder_input(z)
         h = h.view(B, self.enc_C, self.enc_H, self.enc_W)
-
         for stage in self.decoder_stages:
             h = stage(h)
         h = self.final_conv(h)
-
         h = h[:, :, :H, :W]
         return h
 
@@ -397,7 +388,7 @@ class BigConvVAE(nn.Module):
 
 
 # ============================================================
-# TRAINING LOOP WITH TIMING / BOTTLENECK REPORTING
+# TRAINING WITH TIMING + INTERRUPT MENU
 # ============================================================
 
 def train(
@@ -415,7 +406,6 @@ def train(
     n_mels: int = 80,
     n_fft: int = 1024,
     hop_length: int = 256,
-    # denoise/segment params
     threshold_std: float = 0.25,
     use_mean: bool = True,
     chunk_duration: float = 0.05,
@@ -461,21 +451,102 @@ def train(
         dropout=dropout,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.startswith("cuda")))
+    scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
+
+    # ---- interrupt helpers ----
+    interrupted = False
+    current_epoch = 0
+
+    def get_unique_checkpoint_path(base_name: str) -> str:
+        if not os.path.exists(base_name):
+            return base_name
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem, *ext = base_name.rsplit(".", 1)
+        if ext:
+            base = f"{stem}_{ts}.{ext[0]}"
+        else:
+            base = f"{base_name}_{ts}"
+        path = base
+        counter = 1
+        while os.path.exists(path):
+            if ext:
+                path = f"{stem}_{ts}_{counter}.{ext[0]}"
+            else:
+                path = f"{base_name}_{ts}_{counter}"
+            counter += 1
+        return path
+
+    def save_checkpoint(epoch, reason="interrupted"):
+        base = f"big_vae_latent{latent_dim}_epoch{epoch}_{reason}.pt"
+        ckpt_path = get_unique_checkpoint_path(base)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "latent_dim": latent_dim,
+                "beta": beta,
+                "interrupted": True,
+            },
+            ckpt_path,
+        )
+        return ckpt_path
+
+    def handle_interrupt_menu(epoch: int):
+        print("\n" + "=" * 50)
+        print("TRAINING INTERRUPTED")
+        print("=" * 50)
+        print("Choose an option:")
+        print("1. Cancel run and save checkpoint")
+        print("2. Continue run but archive current checkpoint")
+        print("3. Continue run without doing anything")
+        print("4. Cancel run without saving")
+        print("=" * 50)
+        while True:
+            try:
+                choice = input("Enter your choice (1–4): ").strip()
+                if choice == "1":
+                    ck = save_checkpoint(epoch, "cancelled")
+                    print(f"Saved checkpoint: {ck}")
+                    print("Exiting...")
+                    sys.exit(0)
+                elif choice == "2":
+                    ck = save_checkpoint(epoch, "archived")
+                    print(f"Archived checkpoint: {ck}")
+                    print("Continuing training...")
+                    return True
+                elif choice == "3":
+                    print("Continuing training without saving...")
+                    return True
+                elif choice == "4":
+                    print("Exiting without saving...")
+                    sys.exit(0)
+                else:
+                    print("Invalid choice. Please enter 1, 2, 3, or 4.")
+            except (EOFError, KeyboardInterrupt):
+                print("\nForced exit...")
+                sys.exit(0)
+
+    def sigint_handler(signum, frame):
+        nonlocal interrupted
+        # Only set flag; actual menu handled in training loop
+        interrupted = True
+
+    signal.signal(signal.SIGINT, sigint_handler)
+    # ---------------------------
 
     global_step = 0
 
     for epoch in range(1, num_epochs + 1):
+        current_epoch = epoch
         model.train()
         epoch_start = time.perf_counter()
 
-        # Running averages
         running_loss = 0.0
         running_recon = 0.0
         running_kl = 0.0
         running_batches = 0
 
-        # Timing accumulators
         load_time_accum = 0.0
         compute_time_accum = 0.0
         timing_batches = 0
@@ -483,15 +554,21 @@ def train(
         prev_time = time.perf_counter()
 
         for batch_idx, x in enumerate(dataloader):
+            # If we caught a SIGINT since last batch, show menu
+            if interrupted:
+                interrupted = False
+                _ = handle_interrupt_menu(epoch)
+
             batch_start = time.perf_counter()
             data_loading_time = batch_start - prev_time
 
             x = x.to(device, non_blocking=True)
 
-            torch.cuda.synchronize(device) if device.startswith("cuda") else None
-            compute_start = time.perf_counter()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
 
-            with torch.cuda.amp.autocast(enabled=(device.startswith("cuda"))):
+            compute_start = time.perf_counter()
+            with torch.cuda.amp.autocast(enabled=device.startswith("cuda")):
                 recon, mu, logvar = model(x)
                 loss, recon_loss, kl = model.loss_function(recon, x, mu, logvar)
 
@@ -500,7 +577,8 @@ def train(
             scaler.step(optimizer)
             scaler.update()
 
-            torch.cuda.synchronize(device) if device.startswith("cuda") else None
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             compute_end = time.perf_counter()
             compute_time = compute_end - compute_start
 
@@ -543,7 +621,8 @@ def train(
         epoch_time = epoch_end - epoch_start
         print(f"Epoch {epoch} finished in {epoch_time/60:.2f} min")
 
-        ckpt_path = f"big_vae_latent{latent_dim}_epoch{epoch}.pt"
+        ckpt_base = f"big_vae_latent{latent_dim}_epoch{epoch}.pt"
+        ckpt_path = ckpt_base if not os.path.exists(ckpt_base) else get_unique_checkpoint_path(ckpt_base)
         torch.save(
             {
                 "epoch": epoch,
