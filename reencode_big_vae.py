@@ -261,6 +261,12 @@ def encode_decode_file(
         recon_wav = pad_or_trim(recon_wav, target_len)
 
     recon_wav = recon_wav.cpu().unsqueeze(0)              # (1, T)
+
+    # Normalize to [-1, 1] range to prevent clipping when saving as 16-bit PCM
+    max_abs = recon_wav.abs().max()
+    if max_abs > 1e-8:  # Avoid division by zero
+        recon_wav = recon_wav / max_abs
+
     torchaudio.save(str(out_path), recon_wav, sample_rate)
     print(f"Saved reencoded file: {out_path}")
 
