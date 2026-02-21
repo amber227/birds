@@ -3,6 +3,8 @@ import os
 import glob
 import math
 import argparse
+import signal
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -429,6 +431,39 @@ def train(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Global variables for signal handler
+    model = None
+    optimizer = None
+    current_epoch = 0
+    
+    def save_checkpoint_and_exit(epoch, model, optimizer, latent_dim, beta, reason="interrupted"):
+        """Save current model state and exit gracefully"""
+        ckpt_path = f"vae_latent{latent_dim}_epoch{epoch}_{reason}.pt"
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "latent_dim": latent_dim,
+                "beta": beta,
+                "interrupted": True,
+            },
+            ckpt_path,
+        )
+        print(f"\nTraining interrupted! Saved checkpoint: {ckpt_path}")
+        sys.exit(0)
+    
+    def signal_handler(signum, frame):
+        """Handle SIGINT (Ctrl+C) gracefully"""
+        if model is not None and optimizer is not None:
+            save_checkpoint_and_exit(current_epoch, model, optimizer, latent_dim, beta)
+        else:
+            print("\nTraining interrupted before model initialization!")
+            sys.exit(0)
+    
+    # Register signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+
     dataset = SegmentedAudioDataset(
         root_dir=data_dir,
         sample_rate=sample_rate,
@@ -459,56 +494,61 @@ def train(
 
     global_step = 0
 
-    for epoch in range(1, num_epochs + 1):
-        model.train()
-        running_loss = 0.0
-        running_recon = 0.0
-        running_kl = 0.0
-        count = 0
+    try:
+        for epoch in range(1, num_epochs + 1):
+            current_epoch = epoch
+            model.train()
+            running_loss = 0.0
+            running_recon = 0.0
+            running_kl = 0.0
+            count = 0
 
-        for batch_idx, x in enumerate(dataloader):
-            x = x.to(device)
-            recon, mu, logvar = model(x)
-            loss, recon_loss, kl = model.loss_function(recon, x, mu, logvar)
+            for batch_idx, x in enumerate(dataloader):
+                x = x.to(device)
+                recon, mu, logvar = model(x)
+                loss, recon_loss, kl = model.loss_function(recon, x, mu, logvar)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-            running_loss += loss.item()
-            running_recon += recon_loss.item()
-            running_kl += kl.item()
-            count += 1
-            global_step += 1
+                running_loss += loss.item()
+                running_recon += recon_loss.item()
+                running_kl += kl.item()
+                count += 1
+                global_step += 1
 
-            if (batch_idx + 1) % 100 == 0:
+                if (batch_idx + 1) % 100 == 0:
+                    avg_loss = running_loss / count
+                    avg_recon = running_recon / count
+                    avg_kl = running_kl / count
+                    print(
+                        f"Epoch [{epoch}/{num_epochs}] "
+                        f"Step [{batch_idx+1}/{len(dataloader)}] "
+                        f"Loss: {avg_loss:.4f} Recon: {avg_recon:.4f} KL: {avg_kl:.4f}"
+                    )
+                    running_loss = running_recon = running_kl = 0.0
+                    count = 0
+
+            if count > 0:
                 avg_loss = running_loss / count
-                avg_recon = running_recon / count
-                avg_kl = running_kl / count
-                print(
-                    f"Epoch [{epoch}/{num_epochs}] "
-                    f"Step [{batch_idx+1}/{len(dataloader)}] "
-                    f"Loss: {avg_loss:.4f} Recon: {avg_recon:.4f} KL: {avg_kl:.4f}"
-                )
-                running_loss = running_recon = running_kl = 0.0
-                count = 0
+                print(f"End of Epoch {epoch}: avg loss over last window = {avg_loss:.4f}")
 
-        if count > 0:
-            avg_loss = running_loss / count
-            print(f"End of Epoch {epoch}: avg loss over last window = {avg_loss:.4f}")
-
-        ckpt_path = f"vae_latent{latent_dim}_epoch{epoch}.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "latent_dim": latent_dim,
-                "beta": beta,
-            },
-            ckpt_path,
-        )
-        print(f"Saved checkpoint: {ckpt_path}")
+            ckpt_path = f"vae_latent{latent_dim}_epoch{epoch}.pt"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "latent_dim": latent_dim,
+                    "beta": beta,
+                },
+                ckpt_path,
+            )
+            print(f"Saved checkpoint: {ckpt_path}")
+            
+    except KeyboardInterrupt:
+        save_checkpoint_and_exit(current_epoch, model, optimizer, latent_dim, beta)
 
 
 # ============================================================
