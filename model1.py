@@ -461,8 +461,8 @@ def train(
         
         return unique_name
 
-    def save_checkpoint_and_exit(epoch, model, optimizer, latent_dim, beta, reason="interrupted"):
-        """Save current model state and exit gracefully"""
+    def save_checkpoint(epoch, model, optimizer, latent_dim, beta, reason="interrupted"):
+        """Save current model state and return the checkpoint path"""
         base_path = f"vae_latent{latent_dim}_epoch{epoch}_{reason}.pt"
         ckpt_path = get_unique_checkpoint_path(base_path)
         torch.save(
@@ -476,16 +476,62 @@ def train(
             },
             ckpt_path,
         )
-        print(f"\nTraining interrupted! Saved checkpoint: {ckpt_path}")
-        sys.exit(0)
+        return ckpt_path
+    
+    # Flag to handle interruption
+    interrupted = False
     
     def signal_handler(signum, frame):
-        """Handle SIGINT (Ctrl+C) gracefully"""
+        """Handle SIGINT (Ctrl+C) by setting interrupt flag"""
+        nonlocal interrupted
         if model is not None and optimizer is not None:
-            save_checkpoint_and_exit(current_epoch, model, optimizer, latent_dim, beta)
+            interrupted = True
         else:
             print("\nTraining interrupted before model initialization!")
             sys.exit(0)
+    
+    def handle_interrupt_menu(epoch, model, optimizer, latent_dim, beta):
+        """Present interactive menu when training is interrupted"""
+        print("\n" + "="*50)
+        print("TRAINING INTERRUPTED")
+        print("="*50)
+        print("Choose an option:")
+        print("1. Cancel run and save checkpoint")
+        print("2. Continue run but archive current checkpoint")
+        print("3. Continue run without doing anything")
+        print("4. Cancel run without saving")
+        print("="*50)
+        
+        while True:
+            try:
+                choice = input("Enter your choice (1-4): ").strip()
+                
+                if choice == "1":
+                    ckpt_path = save_checkpoint(epoch, model, optimizer, latent_dim, beta, "cancelled")
+                    print(f"Saved checkpoint: {ckpt_path}")
+                    print("Exiting...")
+                    sys.exit(0)
+                    
+                elif choice == "2":
+                    ckpt_path = save_checkpoint(epoch, model, optimizer, latent_dim, beta, "archived")
+                    print(f"Archived checkpoint: {ckpt_path}")
+                    print("Continuing training...")
+                    return True  # Continue training
+                    
+                elif choice == "3":
+                    print("Continuing training without saving...")
+                    return True  # Continue training
+                    
+                elif choice == "4":
+                    print("Exiting without saving...")
+                    sys.exit(0)
+                    
+                else:
+                    print("Invalid choice. Please enter 1, 2, 3, or 4.")
+                    
+            except (EOFError, KeyboardInterrupt):
+                print("\nForced exit...")
+                sys.exit(0)
     
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
@@ -530,6 +576,13 @@ def train(
             count = 0
 
             for batch_idx, x in enumerate(dataloader):
+                # Check for interrupt at the start of each batch
+                if interrupted:
+                    interrupted = False  # Reset flag
+                    continue_training = handle_interrupt_menu(epoch, model, optimizer, latent_dim, beta)
+                    if not continue_training:
+                        return  # This shouldn't happen as menu handles exits
+                
                 x = x.to(device)
                 recon, mu, logvar = model(x)
                 loss, recon_loss, kl = model.loss_function(recon, x, mu, logvar)
@@ -575,7 +628,9 @@ def train(
             print(f"Saved checkpoint: {ckpt_path}")
             
     except KeyboardInterrupt:
-        save_checkpoint_and_exit(current_epoch, model, optimizer, latent_dim, beta)
+        # This shouldn't happen now since we handle interrupts with the flag
+        print("\nUnexpected KeyboardInterrupt - exiting...")
+        sys.exit(0)
 
 
 # ============================================================
