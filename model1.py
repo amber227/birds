@@ -283,6 +283,7 @@ class ConvVAE(nn.Module):
         self.latent_dim = latent_dim
         self.beta = beta
 
+        # Encoder
         enc_channels = [32, 64, 128, 256]
         self.encoder_convs = nn.ModuleList()
         in_ch = in_channels
@@ -295,11 +296,17 @@ class ConvVAE(nn.Module):
             self.encoder_convs.append(block)
             in_ch = out_ch
 
-        self.enc_out_dim = None
+        # Will be lazily initialized once we know encoder output shape
+        self.enc_out_dim = None          # flattened size after conv encoder
+        self.enc_C = None                # channels after conv encoder
+        self.enc_H = None                # height after conv encoder
+        self.enc_W = None                # width after conv encoder
+
         self.fc_mu = None
         self.fc_logvar = None
         self.decoder_input = None
 
+        # Decoder (ConvTranspose stack mirroring encoder)
         self.decoder_convs = nn.ModuleList()
         dec_channels = list(reversed(enc_channels))
         for i in range(len(dec_channels) - 1):
@@ -324,21 +331,31 @@ class ConvVAE(nn.Module):
         )
 
     def encode(self, x):
+        """
+        x: (B, C, H, W) -> mu, logvar in R^latent_dim
+        """
         B = x.size(0)
         h = x
         for block in self.encoder_convs:
-            h = block(h)
-        h = h.view(B, -1)
+            h = block(h)          # (B, C_enc, H_enc, W_enc)
 
+        # Lazily record encoder output shape the first time
         if self.enc_out_dim is None:
-            self.enc_out_dim = h.size(1)
-            self.fc_mu = nn.Linear(self.enc_out_dim, self.latent_dim).to(h.device)
-            self.fc_logvar = nn.Linear(self.enc_out_dim, self.latent_dim).to(h.device)
-            self.decoder_input = nn.Linear(self.latent_dim, self.enc_out_dim).to(h.device)
+            _, C_enc, H_enc, W_enc = h.shape
+            self.enc_C = C_enc
+            self.enc_H = H_enc
+            self.enc_W = W_enc
+            self.enc_out_dim = C_enc * H_enc * W_enc
 
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar, h
+            device = h.device
+            self.fc_mu = nn.Linear(self.enc_out_dim, self.latent_dim).to(device)
+            self.fc_logvar = nn.Linear(self.enc_out_dim, self.latent_dim).to(device)
+            self.decoder_input = nn.Linear(self.latent_dim, self.enc_out_dim).to(device)
+
+        h_flat = h.view(B, -1)
+        mu = self.fc_mu(h_flat)
+        logvar = self.fc_logvar(h_flat)
+        return mu, logvar, h_flat
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -346,19 +363,23 @@ class ConvVAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z, target_shape):
+        """
+        z: (B, latent_dim)
+        target_shape: shape of x = (B, 1, H, W) so we can crop final output.
+        """
         B = z.size(0)
         H, W = target_shape[2], target_shape[3]
-        h = self.decoder_input(z)
 
-        num_downsamples = len(self.encoder_convs)
-        H_enc = max(1, H // (2 ** num_downsamples))
-        W_enc = max(1, W // (2 ** num_downsamples))
-        C_enc = self.enc_out_dim // (H_enc * W_enc)
+        # Map latent back to encoder feature map size
+        h = self.decoder_input(z)                    # (B, enc_out_dim)
+        h = h.view(B, self.enc_C, self.enc_H, self.enc_W)
 
-        h = h.view(B, C_enc, H_enc, W_enc)
+        # ConvTranspose2d stack
         for block in self.decoder_convs:
             h = block(h)
         h = self.final_conv(h)
+
+        # Crop spatial dims to exactly match input H, W
         h = h[:, :, :H, :W]
         return h
 
