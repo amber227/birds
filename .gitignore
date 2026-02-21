@@ -11,3 +11,4 @@ test*/
 
 # Virtual environments
 .venv
+.aider*
