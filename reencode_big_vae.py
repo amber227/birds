@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 import argparse
-import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from torchaudio.transforms import MelSpectrogram, AmplitudeToDB, InverseMelScale, GriffinLim
+from torchaudio.transforms import MelSpectrogram, AmplitudeToDB, GriffinLim
 
 
 # ============================================================
@@ -163,7 +162,7 @@ def pad_or_trim(wav: torch.Tensor, target_len: int) -> torch.Tensor:
     return wav
 
 
-def prepare_transforms(sample_rate: int, n_mels: int, n_fft: int, hop_length: int):
+def prepare_transforms(sample_rate: int, n_mels: int, n_fft: int, hop_length: int, device: torch.device):
     mel = MelSpectrogram(
         sample_rate=sample_rate,
         n_fft=n_fft,
@@ -174,19 +173,33 @@ def prepare_transforms(sample_rate: int, n_mels: int, n_fft: int, hop_length: in
         center=True,
         pad_mode="reflect",
         power=2.0,
-    )
-    to_db = AmplitudeToDB(stype="power")
-    inv_mel = InverseMelScale(
-        n_stft=n_fft // 2 + 1,
-        n_mels=n_mels,
-        sample_rate=sample_rate,
-    )
+    ).to(device)
+    to_db = AmplitudeToDB(stype="power").to(device)
+
+    # Get mel filterbank (n_mels, n_stft)
+    fb = mel.mel_scale.fb.to(device)          # (n_mels, n_stft)
+    # Precompute pseudo-inverse: (n_stft, n_mels)
+    fb_pinv = torch.linalg.pinv(fb)           # (n_stft, n_mels)
+
     griffin = GriffinLim(
         n_fft=n_fft,
         hop_length=hop_length,
         power=1.0,  # expects magnitude
-    )
-    return mel, to_db, inv_mel, griffin
+    ).to(device)
+
+    return mel, to_db, fb_pinv, griffin
+
+
+def mel_to_linear_power(mel_power: torch.Tensor, fb_pinv: torch.Tensor) -> torch.Tensor:
+    """
+    mel_power: (1, n_mels, T)
+    fb_pinv: (n_stft, n_mels)
+    returns: (1, n_stft, T)
+    """
+    # (n_stft, n_mels) @ (n_mels, T) -> (n_stft, T)
+    linear = fb_pinv @ mel_power[0]
+    linear = torch.clamp(linear, min=0.0)
+    return linear.unsqueeze(0)
 
 
 def encode_decode_file(
@@ -203,12 +216,12 @@ def encode_decode_file(
     model.eval()
     target_len = int(sample_rate * duration_sec)
 
-    mel, to_db, inv_mel, griffin = prepare_transforms(sample_rate, n_mels, n_fft, hop_length)
+    mel, to_db, fb_pinv, griffin = prepare_transforms(sample_rate, n_mels, n_fft, hop_length, device)
 
     # ----- load and preprocess -----
     wav = load_mono_resampled(in_path, sample_rate)       # (T,)
     wav = pad_or_trim(wav, target_len)                    # (T,)
-    wav = wav.unsqueeze(0)                                # (1, T)
+    wav = wav.unsqueeze(0).to(device)                     # (1, T)
 
     with torch.no_grad():
         # Mel -> log-mel, normalize (same as dataset)
@@ -219,11 +232,11 @@ def encode_decode_file(
         std = log_mel.std() + 1e-8
         log_mel_norm = (log_mel - mean) / std             # (1, n_mels, T_frames)
 
-        x = log_mel_norm.unsqueeze(0).to(device)          # (B=1, 1, n_mels, T_frames)
+        x = log_mel_norm.unsqueeze(0)                     # (B=1, 1, n_mels, T_frames)
 
         # ----- VAE forward -----
         recon, mu, logvar = model(x)                      # (1, 1, n_mels, T_frames)
-        recon = recon.squeeze(0).cpu()                    # (1, n_mels, T_frames)
+        recon = recon.squeeze(0)                          # (1, n_mels, T_frames)
 
         # ----- denormalize log-mel -----
         recon_log_mel = recon * std + mean                # (1, n_mels, T_frames)
@@ -233,8 +246,8 @@ def encode_decode_file(
             recon_log_mel, ref=1.0, power=2.0
         )                                                 # (1, n_mels, T_frames)
 
-        # mel power -> linear power
-        linear_power = inv_mel(mel_power)                 # (1, n_stft, T_frames)
+        # mel power -> linear power via pseudo-inverse
+        linear_power = mel_to_linear_power(mel_power, fb_pinv)  # (1, n_stft, T_frames)
 
         # power -> magnitude
         magnitude = torch.sqrt(torch.clamp(linear_power, min=1e-10))
@@ -245,7 +258,7 @@ def encode_decode_file(
         # pad/trim again to target_len for consistency
         recon_wav = pad_or_trim(recon_wav, target_len)
 
-    recon_wav = recon_wav.unsqueeze(0)                    # (1, T)
+    recon_wav = recon_wav.cpu().unsqueeze(0)              # (1, T)
     torchaudio.save(str(out_path), recon_wav, sample_rate)
     print(f"Saved reencoded file: {out_path}")
 
@@ -268,10 +281,7 @@ def load_model(model_path: Path, device: torch.device, n_mels: int, duration_sec
     ).to(device)
 
     # Build encoder/decoder linear layers with correct spatial dims
-    # Use same mel shape that was used in training
     target_len = int(sample_rate * duration_sec)
-    # torchaudio MelSpectrogram with center=True gives approx:
-    # frames = 1 + T // hop_length
     frames = 1 + target_len // hop_length
     dummy = torch.zeros(1, 1, n_mels, frames, device=device)
     with torch.no_grad():
