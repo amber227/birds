@@ -4,16 +4,19 @@ import sys
 import time
 import argparse
 import signal
+import threading
+import queue
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 import torchaudio
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
@@ -70,7 +73,7 @@ def find_segments(
     chunk_size: int,
     chunk_duration: float,
     min_segment_duration: float,
-):
+) -> List[Tuple[int, int]]:
     padded = np.pad(chunk_mask, (1, 1), mode='constant', constant_values=0)
     starts = np.where(np.diff(padded.astype(int)) == 1)[0]
     ends = np.where(np.diff(padded.astype(int)) == -1)[0]
@@ -94,16 +97,23 @@ class SegmentInfo:
 
 
 # ============================================================
-# DATASET: SEGMENTED, DENOISED ON THE FLY → LOG-MEL
+# STREAMING SEGMENTED DATASET + DISK LOG-MEL CACHE
 # ============================================================
 
-class SegmentedAudioDataset(Dataset):
+class StreamingSegmentedAudioDataset(IterableDataset):
     """
-    Offline index of all segments, but no intermediate files:
-      - Finds all audio files under root_dir.
-      - For each: denoise+segment to build a list of (start,end).
-      - __getitem__ loads just that segment, crops/pads to fixed length,
-        and converts to log-mel.
+    Streaming dataset that:
+      - Starts a background thread to:
+          * find audio files
+          * denoise+segment them
+          * put SegmentInfo into a queue
+      - __iter__:
+          * pulls SegmentInfo from queue
+          * computes or loads log-mel from mel_cache/
+          * yields normalized log-mel (1, n_mels, T_frames)
+
+    log-mels are cached on disk in mel_cache/ using a stable segment ID,
+    and are reused across epochs and separate runs.
     """
 
     def __init__(
@@ -121,12 +131,19 @@ class SegmentedAudioDataset(Dataset):
         chunk_duration: float = 0.05,
         padding_chunks: int = 5,
         min_segment_duration: float = 0.3,
+        queue_size: int = 1000,
+        min_queue_size: int = 100,
+        cache_dir: str | Path = "mel_cache",
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
         self.sample_rate = sample_rate
         self.target_len = int(sample_rate * target_duration_sec)
 
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # log-mel transforms
         self.mel = MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -140,21 +157,31 @@ class SegmentedAudioDataset(Dataset):
         )
         self.to_db = AmplitudeToDB(stype="power")
 
+        # denoise/segment params
         self.threshold_std = threshold_std
         self.use_mean = use_mean
         self.chunk_duration = chunk_duration
         self.padding_chunks = padding_chunks
         self.min_segment_duration = min_segment_duration
 
-        self.segments: list[SegmentInfo] = []
-        self._build_index()
+        # streaming setup
+        self.queue_size = queue_size
+        self.min_queue_size = min_queue_size
+        self.segment_queue: queue.Queue[SegmentInfo] = queue.Queue(maxsize=queue_size)
+        self.processing_complete = threading.Event()
+        self.stop_processing = threading.Event()
 
-        if len(self.segments) == 0:
-            raise RuntimeError(f"No segments found under {root_dir} with current settings")
-        print(f"Indexed {len(self.segments)} segments from audio in {root_dir}")
+        # stats
+        self.total_segments_found = 0
+        self.total_files_processed = 0
+        self.total_files = 0
 
-    def _find_audio_files(self):
-        audio_files = []
+        self._start_processing()
+
+    # ---------- file & segmentation ----------
+
+    def _find_audio_files(self) -> List[Path]:
+        audio_files: List[Path] = []
         for root, dirs, files in os.walk(self.root_dir):
             for fname in files:
                 p = Path(root) / fname
@@ -162,22 +189,30 @@ class SegmentedAudioDataset(Dataset):
                     audio_files.append(p)
         return sorted(audio_files)
 
-    def _load_mono_resampled(self, path: Path):
+    def _load_mono_resampled(self, path: Path) -> Tuple[np.ndarray, int]:
         wav, sr = torchaudio.load(str(path))  # (C, T)
         if wav.size(0) > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
             sr = self.sample_rate
-        return wav.squeeze(0).cpu().numpy().astype(np.float32), sr
+        audio = wav.squeeze(0).cpu().numpy().astype(np.float32)
+        return audio, sr
 
-    def _build_index(self):
-        print(f"Scanning and segmenting audio under {self.root_dir} ...")
+    def _process_files_worker(self):
+        print(f"Starting background processing of audio files in {self.root_dir}")
         files = self._find_audio_files()
         if not files:
-            raise RuntimeError(f"No audio files found under {self.root_dir}")
+            print(f"No audio files found under {self.root_dir}")
+            self.processing_complete.set()
+            return
+
+        self.total_files = len(files)
+        print(f"Found {self.total_files} audio files to process")
 
         for i, path in enumerate(files, 1):
+            if self.stop_processing.is_set():
+                break
             try:
                 audio, sr = self._load_mono_resampled(path)
                 if len(audio) == 0:
@@ -201,26 +236,59 @@ class SegmentedAudioDataset(Dataset):
                     self.chunk_duration,
                     self.min_segment_duration,
                 )
+
                 for start, end in segs:
+                    if self.stop_processing.is_set():
+                        break
                     end = min(end, len(audio))
                     if end <= start:
                         continue
-                    self.segments.append(
-                        SegmentInfo(
-                            file_path=path,
-                            start_sample=int(start),
-                            end_sample=int(end),
-                            sr=sr,
-                        )
+                    seg_info = SegmentInfo(
+                        file_path=path,
+                        start_sample=int(start),
+                        end_sample=int(end),
+                        sr=sr,
                     )
+                    while not self.stop_processing.is_set():
+                        try:
+                            self.segment_queue.put(seg_info, timeout=1.0)
+                            self.total_segments_found += 1
+                            break
+                        except queue.Full:
+                            continue
 
-                if i % 100 == 0 or i == len(files):
-                    print(f"  Processed {i}/{len(files)} files, segments so far: {len(self.segments)}")
+                self.total_files_processed += 1
+                if i % 10 == 0 or i == len(files):
+                    print(
+                        f"  Processed {i}/{len(files)} files, "
+                        f"segments found: {self.total_segments_found}, "
+                        f"queue size: {self.segment_queue.qsize()}"
+                    )
             except Exception as e:
                 print(f"Error processing {path}: {e}")
 
-    def __len__(self):
-        return len(self.segments)
+        print(f"Background processing complete. Total segments found: {self.total_segments_found}")
+        self.processing_complete.set()
+
+    def _start_processing(self):
+        self.processing_thread = threading.Thread(
+            target=self._process_files_worker, daemon=True
+        )
+        self.processing_thread.start()
+
+        print("Waiting for initial segments to be processed...")
+        while (
+            self.segment_queue.qsize() < self.min_queue_size
+            and not self.processing_complete.is_set()
+        ):
+            time.sleep(0.1)
+
+        if self.segment_queue.qsize() > 0:
+            print(f"Ready to start training with {self.segment_queue.qsize()} segments queued")
+        elif self.processing_complete.is_set():
+            if self.total_segments_found == 0:
+                raise RuntimeError(f"No segments found under {self.root_dir} with current settings")
+            print(f"Processing complete with {self.total_segments_found} total segments")
 
     def _extract_segment_waveform(self, seg: SegmentInfo) -> torch.Tensor:
         audio, sr = self._load_mono_resampled(seg.file_path)
@@ -230,30 +298,66 @@ class SegmentedAudioDataset(Dataset):
         segment = audio[start:end]
         if len(segment) == 0:
             segment = np.zeros(1, dtype=np.float32)
-
         if len(segment) > self.target_len:
-            segment = segment[:self.target_len]
+            segment = segment[: self.target_len]
         elif len(segment) < self.target_len:
             pad_len = self.target_len - len(segment)
             segment = np.pad(segment, (0, pad_len), mode="constant")
         return torch.from_numpy(segment).unsqueeze(0)  # (1, T)
 
-    def __getitem__(self, idx):
-        seg = self.segments[idx]
-        wav = self._extract_segment_waveform(seg)  # (1, T)
+    # ---------- log-mel caching ----------
 
+    def _segment_cache_path(self, seg: SegmentInfo) -> Path:
+        rel = seg.file_path.relative_to(self.root_dir)
+        key_str = f"{rel.as_posix()}::{seg.start_sample}::{seg.end_sample}"
+        seg_id = hashlib.sha1(key_str.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{seg_id}.pt"
+
+    def _compute_log_mel(self, wav: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             mel = self.mel(wav)  # (1, n_mels, T_frames)
             log_mel = self.to_db(mel + 1e-6)
-
         mean = log_mel.mean()
         std = log_mel.std() + 1e-8
         log_mel = (log_mel - mean) / std
-        return log_mel  # (1, n_mels, T_frames)
+        return log_mel  # (1, n_mels, T)
+
+    def __iter__(self):
+        segments_yielded = 0
+        while True:
+            try:
+                seg = self.segment_queue.get(timeout=1.0)
+                cache_path = self._segment_cache_path(seg)
+
+                if cache_path.exists():
+                    log_mel = torch.load(cache_path)
+                else:
+                    wav = self._extract_segment_waveform(seg)  # (1, T)
+                    log_mel = self._compute_log_mel(wav)
+                    try:
+                        torch.save(log_mel, cache_path)
+                    except Exception as e:
+                        print(f"Warning: failed to write cache {cache_path}: {e}")
+
+                segments_yielded += 1
+                yield log_mel  # (1, n_mels, T_frames)
+            except queue.Empty:
+                if self.processing_complete.is_set() and self.segment_queue.empty():
+                    print(f"Finished iterating over all segments. Total yielded: {segments_yielded}")
+                    break
+                continue
+
+    def stop(self):
+        self.stop_processing.set()
+        if hasattr(self, "processing_thread"):
+            self.processing_thread.join(timeout=5.0)
+
+    def __del__(self):
+        self.stop()
 
 
 # ============================================================
-# BIGGER VAE (DEEPER, MORE CHANNELS, RESBLOCKS)
+# BIGGER VAE
 # ============================================================
 
 class ResBlock2d(nn.Module):
@@ -280,13 +384,6 @@ class ResBlock2d(nn.Module):
 
 
 class BigConvVAE(nn.Module):
-    """
-    Deeper and wider VAE:
-      - Encoder: 5 downsampling stages, channels 64, 128, 256, 512, 512
-      - Each stage: Conv(stride=2) + ResBlock
-      - Latent dim: configurable
-    """
-
     def __init__(self, in_channels=1, latent_dim=256, beta=0.1, dropout=0.0):
         super().__init__()
         self.latent_dim = latent_dim
@@ -325,7 +422,7 @@ class BigConvVAE(nn.Module):
                     out_ch,
                     kernel_size=4,
                     stride=2,
-padding=1,
+                    padding=1,
                     output_padding=0,
                 ),
                 nn.BatchNorm2d(out_ch),
@@ -397,12 +494,11 @@ def train(
     data_dir: str,
     latent_dim: int = 256,
     batch_size: int = 64,
-    num_epochs: int = 10,
+    num_epochs: int = 1,
     lr: float = 2e-4,
     beta: float = 0.2,
     dropout: float = 0.1,
-    num_workers: int = 8,
-    device: str | None = None,
+    device: Optional[str] = None,
     sample_rate: int = 16000,
     duration_sec: float = 10.0,
     n_mels: int = 80,
@@ -420,7 +516,7 @@ def train(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    dataset = SegmentedAudioDataset(
+    dataset = StreamingSegmentedAudioDataset(
         root_dir=data_dir,
         sample_rate=sample_rate,
         target_duration_sec=duration_sec,
@@ -437,12 +533,13 @@ def train(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
+        shuffle=False,  # IterableDataset
+        num_workers=0,  # dataset already uses threads
         pin_memory=True,
         drop_last=True,
     )
 
+    print("Getting example batch to determine input shape...")
     example = next(iter(dataloader))
     print(f"Example batch shape (log-mel): {example.shape}")
 
@@ -455,9 +552,7 @@ def train(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
 
-    # ---- interrupt helpers ----
     interrupted = False
-    current_epoch = 0
 
     def get_unique_checkpoint_path(base_name: str) -> str:
         if not os.path.exists(base_name):
@@ -478,7 +573,7 @@ def train(
             counter += 1
         return path
 
-    def save_checkpoint(epoch, reason="interrupted"):
+    def save_checkpoint(epoch: int, reason: str = "interrupted") -> str:
         base = f"big_vae_latent{latent_dim}_epoch{epoch}_{reason}.pt"
         ckpt_path = get_unique_checkpoint_path(base)
         torch.save(
@@ -511,6 +606,7 @@ def train(
                     ck = save_checkpoint(epoch, "cancelled")
                     print(f"Saved checkpoint: {ck}")
                     print("Exiting...")
+                    dataset.stop()
                     sys.exit(0)
                 elif choice == "2":
                     ck = save_checkpoint(epoch, "archived")
@@ -522,25 +618,24 @@ def train(
                     return True
                 elif choice == "4":
                     print("Exiting without saving...")
+                    dataset.stop()
                     sys.exit(0)
                 else:
                     print("Invalid choice. Please enter 1, 2, 3, or 4.")
             except (EOFError, KeyboardInterrupt):
                 print("\nForced exit...")
+                dataset.stop()
                 sys.exit(0)
 
     def sigint_handler(signum, frame):
         nonlocal interrupted
-        # Only set flag; actual menu handled in training loop
         interrupted = True
 
     signal.signal(signal.SIGINT, sigint_handler)
-    # ---------------------------
 
     global_step = 0
 
     for epoch in range(1, num_epochs + 1):
-        current_epoch = epoch
         model.train()
         epoch_start = time.perf_counter()
 
@@ -556,7 +651,6 @@ def train(
         prev_time = time.perf_counter()
 
         for batch_idx, x in enumerate(dataloader):
-            # If we caught a SIGINT since last batch, show menu
             if interrupted:
                 interrupted = False
                 _ = handle_interrupt_menu(epoch)
@@ -607,7 +701,7 @@ def train(
 
                 print(
                     f"Epoch [{epoch}/{num_epochs}] "
-                    f"Step [{batch_idx+1}/{len(dataloader)}] "
+                    f"Step {batch_idx+1} "
                     f"Loss: {avg_loss:.4f} Recon: {avg_recon:.4f} KL: {avg_kl:.4f} | "
                     f"Avg load: {avg_load*1000:.1f} ms, "
                     f"Avg compute: {avg_compute*1000:.1f} ms "
@@ -620,11 +714,10 @@ def train(
                 timing_batches = 0
 
         epoch_end = time.perf_counter()
-        epoch_time = epoch_end - epoch_start
-        print(f"Epoch {epoch} finished in {epoch_time/60:.2f} min")
+        print(f"Epoch {epoch} finished in {(epoch_end-epoch_start)/60:.2f} min")
 
-        ckpt_base = f"big_vae_latent{latent_dim}_epoch{epoch}.pt"
-        ckpt_path = ckpt_base if not os.path.exists(ckpt_base) else get_unique_checkpoint_path(ckpt_base)
+        base = f"big_vae_latent{latent_dim}_epoch{epoch}.pt"
+        ckpt_path = base if not os.path.exists(base) else get_unique_checkpoint_path(base)
         torch.save(
             {
                 "epoch": epoch,
@@ -637,23 +730,24 @@ def train(
         )
         print(f"Saved checkpoint: {ckpt_path}")
 
+    dataset.stop()
+
 
 # ============================================================
 # CLI
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train a bigger ConvVAE on denoised+segmented audio (log-mel).")
+    p = argparse.ArgumentParser(description="Train a bigger ConvVAE on streaming denoised+segmented audio with log-mel cache.")
     p.add_argument("--data_dir", type=str, required=True)
 
     p.add_argument("--latent_dim", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--num_epochs", type=int, default=10)
+    p.add_argument("--num_epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--beta", type=float, default=0.2)
     p.add_argument("--dropout", type=float, default=0.1)
 
-    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--device", type=str, default=None)
 
     p.add_argument("--sample_rate", type=int, default=16000)
@@ -685,7 +779,6 @@ def main():
         lr=args.lr,
         beta=args.beta,
         dropout=args.dropout,
-        num_workers=args.num_workers,
         device=args.device,
         sample_rate=args.sample_rate,
         duration_sec=args.duration_sec,
