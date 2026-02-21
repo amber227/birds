@@ -417,6 +417,11 @@ def reencode_files(
         elif T < target_len:
             recon_wav = torch.nn.functional.pad(recon_wav, (0, target_len - T))
 
+        # Normalize to [-1, 1] range to prevent clipping when saving as 16-bit PCM
+        max_abs = recon_wav.abs().max()
+        if max_abs > 1e-8:  # Avoid division by zero
+            recon_wav = recon_wav / max_abs
+
         out_path = path.with_name(f"{path.stem}-reencoded{path.suffix}")
         torchaudio.save(str(out_path), recon_wav, sample_rate)
         print(f"  Saved {out_path}")
