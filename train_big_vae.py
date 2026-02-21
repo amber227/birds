@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
-import glob
 import argparse
+import signal
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
@@ -92,16 +94,20 @@ class SegmentInfo:
 
 
 # ============================================================
-# DATASET: SEGMENTED, DENOISED ON THE FLY → LOG-MEL
+# DATASET: SEGMENTED, DENOISED ON THE FLY → LOG-MEL (WITH CACHE)
 # ============================================================
 
 class SegmentedAudioDataset(Dataset):
     """
-    Offline index of all segments, but no intermediate files:
-      - Finds all audio files under root_dir.
-      - For each: denoise+segment to build a list of (start,end).
-      - __getitem__ loads just that segment, crops/pads to fixed length,
-        and converts to log-mel.
+    - Builds an index of segments (start/end sample) for all files under root_dir.
+    - __getitem__:
+        * If cache exists for this segment, load log-mel from cache.
+        * Otherwise:
+            - load waveform,
+            - crop/pad to fixed length,
+            - compute log-mel and per-sample normalization,
+            - save to cache (float16),
+            - return log-mel (float32) tensor.
     """
 
     def __init__(
@@ -119,6 +125,7 @@ class SegmentedAudioDataset(Dataset):
         chunk_duration: float = 0.05,
         padding_chunks: int = 5,
         min_segment_duration: float = 0.3,
+        cache_dir: str | None = None,
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -144,12 +151,20 @@ class SegmentedAudioDataset(Dataset):
         self.padding_chunks = padding_chunks
         self.min_segment_duration = min_segment_duration
 
+        # Cache configuration
+        if cache_dir is None:
+            self.cache_dir = self.root_dir / ".mel_cache"
+        else:
+            self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
         self.segments: list[SegmentInfo] = []
         self._build_index()
 
         if len(self.segments) == 0:
             raise RuntimeError(f"No segments found under {root_dir} with current settings")
         print(f"Indexed {len(self.segments)} segments from audio in {root_dir}")
+        print(f"Cache directory: {self.cache_dir}")
 
     def _find_audio_files(self):
         audio_files = []
@@ -220,6 +235,13 @@ class SegmentedAudioDataset(Dataset):
     def __len__(self):
         return len(self.segments)
 
+    def _cache_path_for_segment(self, seg: SegmentInfo, seg_idx: int) -> Path:
+        rel = seg.file_path.relative_to(self.root_dir)
+        rel_no_ext = rel.with_suffix("")  # drop extension
+        # Use the index within the global segment list for uniqueness
+        cache_rel = rel_no_ext.with_name(rel_no_ext.name + f"_seg{seg_idx:06d}.pt")
+        return self.cache_dir / cache_rel
+
     def _extract_segment_waveform(self, seg: SegmentInfo) -> torch.Tensor:
         audio, sr = self._load_mono_resampled(seg.file_path)
         assert sr == self.sample_rate
@@ -236,18 +258,42 @@ class SegmentedAudioDataset(Dataset):
             segment = np.pad(segment, (0, pad_len), mode="constant")
         return torch.from_numpy(segment).unsqueeze(0)  # (1, T)
 
-    def __getitem__(self, idx):
-        seg = self.segments[idx]
-        wav = self._extract_segment_waveform(seg)  # (1, T)
-
+    def _compute_logmel(self, wav: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             mel = self.mel(wav)  # (1, n_mels, T_frames)
             log_mel = self.to_db(mel + 1e-6)
-
         mean = log_mel.mean()
         std = log_mel.std() + 1e-8
         log_mel = (log_mel - mean) / std
         return log_mel  # (1, n_mels, T_frames)
+
+    def __getitem__(self, idx):
+        seg = self.segments[idx]
+        cache_path = self._cache_path_for_segment(seg, idx)
+
+        # Load from cache if exists
+        if cache_path.exists():
+            try:
+                cached = torch.load(cache_path, map_location="cpu")
+                # Expect cached shape: (1, n_mels, T_frames), dtype float16
+                log_mel = cached["log_mel"].float()
+                return log_mel
+            except Exception as e:
+                print(f"Warning: failed to load cache {cache_path}: {e}, recomputing...")
+
+        # Otherwise compute and cache
+        wav = self._extract_segment_waveform(seg)  # (1, T)
+        log_mel = self._compute_logmel(wav)        # (1, n_mels, T_frames)
+
+        # Save in cache as float16 to reduce disk usage
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        to_save = {"log_mel": log_mel.half()}
+        try:
+            torch.save(to_save, cache_path)
+        except Exception as e:
+            print(f"Warning: failed to save cache {cache_path}: {e}")
+
+        return log_mel
 
 
 # ============================================================
@@ -278,13 +324,6 @@ class ResBlock2d(nn.Module):
 
 
 class BigConvVAE(nn.Module):
-    """
-    Deeper and wider VAE:
-      - Encoder: 5 downsampling stages, channels 64, 128, 256, 512, 512
-      - Each stage: Conv(stride=2) + ResBlock
-      - Latent dim: configurable
-    """
-
     def __init__(self, in_channels=1, latent_dim=256, beta=0.1, dropout=0.0):
         super().__init__()
         self.latent_dim = latent_dim
@@ -323,7 +362,7 @@ class BigConvVAE(nn.Module):
                     out_ch,
                     kernel_size=4,
                     stride=2,
-padding=1,
+                    padding=1,
                     output_padding=0,
                 ),
                 nn.BatchNorm2d(out_ch),
@@ -430,6 +469,7 @@ def train(
         chunk_duration=chunk_duration,
         padding_chunks=padding_chunks,
         min_segment_duration=min_segment_duration,
+        cache_dir=None,  # default .mel_cache inside data_dir
     )
 
     dataloader = DataLoader(
@@ -453,9 +493,8 @@ def train(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
 
-    # ---- interrupt helpers ----
+    # interrupt helpers
     interrupted = False
-    current_epoch = 0
 
     def get_unique_checkpoint_path(base_name: str) -> str:
         if not os.path.exists(base_name):
@@ -529,16 +568,13 @@ def train(
 
     def sigint_handler(signum, frame):
         nonlocal interrupted
-        # Only set flag; actual menu handled in training loop
         interrupted = True
 
     signal.signal(signal.SIGINT, sigint_handler)
-    # ---------------------------
 
     global_step = 0
 
     for epoch in range(1, num_epochs + 1):
-        current_epoch = epoch
         model.train()
         epoch_start = time.perf_counter()
 
@@ -554,7 +590,6 @@ def train(
         prev_time = time.perf_counter()
 
         for batch_idx, x in enumerate(dataloader):
-            # If we caught a SIGINT since last batch, show menu
             if interrupted:
                 interrupted = False
                 _ = handle_interrupt_menu(epoch)
@@ -566,8 +601,8 @@ def train(
 
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
-
             compute_start = time.perf_counter()
+
             with torch.cuda.amp.autocast(enabled=device.startswith("cuda")):
                 recon, mu, logvar = model(x)
                 loss, recon_loss, kl = model.loss_function(recon, x, mu, logvar)
@@ -641,7 +676,7 @@ def train(
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train a bigger ConvVAE on denoised+segmented audio (log-mel).")
+    p = argparse.ArgumentParser(description="Train a bigger ConvVAE on denoised+segmented audio (log-mel), with caching.")
     p.add_argument("--data_dir", type=str, required=True)
 
     p.add_argument("--latent_dim", type=int, default=256)
