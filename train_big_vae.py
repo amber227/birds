@@ -567,6 +567,15 @@ def train(
         beta=beta,
         dropout=dropout,
     ).to(device)
+
+    # CRITICAL: Initialize lazy layers before creating optimizer
+    # The model creates fc_mu, fc_logvar, and decoder_input during the first forward pass
+    print("Initializing lazy layers with dummy forward pass...")
+    with torch.no_grad():
+        dummy_input = example[:1].to(device)  # Use single sample from batch
+        _ = model(dummy_input)
+    print(f"Lazy layers initialized. Total parameters: {sum(p.numel() for p in model.parameters())}")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
 
