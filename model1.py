@@ -706,7 +706,7 @@ def train(
                     avg_kl = running_kl / count
                     print(
                         f"Epoch [{epoch}/{num_epochs}] "
-                        f"Step [{batch_idx+1}/{len(dataloader)}] "
+                        f"Step {batch_idx+1} "
                         f"Loss: {avg_loss:.4f} Recon: {avg_recon:.4f} KL: {avg_kl:.4f}"
                     )
                     running_loss = running_recon = running_kl = 0.0
