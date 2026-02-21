@@ -5,6 +5,7 @@ import math
 import argparse
 import signal
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -436,9 +437,34 @@ def train(
     optimizer = None
     current_epoch = 0
     
+    def get_unique_checkpoint_path(base_name: str) -> str:
+        """Generate a unique checkpoint path that doesn't overwrite existing files"""
+        if not os.path.exists(base_name):
+            return base_name
+        
+        # Add timestamp to make it unique
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name_parts = base_name.rsplit('.', 1)
+        if len(name_parts) == 2:
+            unique_name = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+        else:
+            unique_name = f"{base_name}_{timestamp}"
+        
+        # If still exists (very unlikely), add a counter
+        counter = 1
+        while os.path.exists(unique_name):
+            if len(name_parts) == 2:
+                unique_name = f"{name_parts[0]}_{timestamp}_{counter}.{name_parts[1]}"
+            else:
+                unique_name = f"{base_name}_{timestamp}_{counter}"
+            counter += 1
+        
+        return unique_name
+
     def save_checkpoint_and_exit(epoch, model, optimizer, latent_dim, beta, reason="interrupted"):
         """Save current model state and exit gracefully"""
-        ckpt_path = f"vae_latent{latent_dim}_epoch{epoch}_{reason}.pt"
+        base_path = f"vae_latent{latent_dim}_epoch{epoch}_{reason}.pt"
+        ckpt_path = get_unique_checkpoint_path(base_path)
         torch.save(
             {
                 "epoch": epoch,
@@ -534,7 +560,8 @@ def train(
                 avg_loss = running_loss / count
                 print(f"End of Epoch {epoch}: avg loss over last window = {avg_loss:.4f}")
 
-            ckpt_path = f"vae_latent{latent_dim}_epoch{epoch}.pt"
+            base_path = f"vae_latent{latent_dim}_epoch{epoch}.pt"
+            ckpt_path = get_unique_checkpoint_path(base_path)
             torch.save(
                 {
                     "epoch": epoch,
