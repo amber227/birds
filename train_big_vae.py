@@ -15,6 +15,9 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+
 # ============================================================
 # DENOISE + SEGMENT CORE (from your SimpleAudioDenoiser, segment mode)
 # ============================================================
