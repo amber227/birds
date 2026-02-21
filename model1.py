@@ -3,8 +3,11 @@ import os
 import glob
 import math
 import argparse
-from typing import List
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,37 +16,126 @@ import torchaudio
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
 # ============================================================
-# Dataset
+# Denoise + segmentation core (ported from SimpleAudioDenoiser)
 # ============================================================
 
-class AudioDataset(Dataset):
+AUDIO_EXTENSIONS = {
+    '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.wma',
+    '.opus', '.wav', '.aiff', '.ape', '.ac3', '.amr'
+}
+
+
+def calculate_chunk_volumes(audio: np.ndarray, sr: int, chunk_duration: float) -> Tuple[np.ndarray, int]:
     """
-    Loads mono WAV files from a directory, crops/pads to fixed duration,
-    and converts to log-mel spectrograms.
+    Calculate RMS volume for each chunk of audio.
+    Returns (chunk_volumes, chunk_size_samples).
     """
+    chunk_size = int(chunk_duration * sr)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive; check chunk_duration and sample rate")
+
+    num_chunks = int(np.ceil(len(audio) / chunk_size))
+    padded_length = num_chunks * chunk_size
+    padded_audio = np.pad(audio, (0, padded_length - len(audio)), mode='constant')
+
+    chunks = padded_audio.reshape(num_chunks, chunk_size)
+    chunk_volumes = np.sqrt(np.mean(chunks ** 2, axis=1))
+    return chunk_volumes, chunk_size
+
+
+def calculate_threshold(chunk_volumes: np.ndarray, threshold_std: float, use_mean: bool) -> float:
+    mean_vol = np.mean(chunk_volumes)
+    std_vol = np.std(chunk_volumes)
+    if use_mean:
+        threshold = mean_vol + (threshold_std * std_vol)
+    else:
+        threshold = threshold_std * std_vol
+    return threshold
+
+
+def expand_mask(chunk_mask: np.ndarray, padding_chunks: int) -> np.ndarray:
+    if padding_chunks == 0:
+        return chunk_mask
+    expanded_mask = np.copy(chunk_mask)
+    above_indices = np.where(chunk_mask)[0]
+    for idx in above_indices:
+        start = max(0, idx - padding_chunks)
+        end = min(len(chunk_mask), idx + padding_chunks + 1)
+        expanded_mask[start:end] = True
+    return expanded_mask
+
+
+def find_segments(
+    chunk_mask: np.ndarray,
+    chunk_size: int,
+    chunk_duration: float,
+    min_segment_duration: float
+) -> List[Tuple[int, int]]:
+    """
+    Returns list of (start_sample, end_sample) for segments of consecutive
+    chunks above threshold, filtered by min_segment_duration (in seconds).
+    """
+    padded = np.pad(chunk_mask, (1, 1), mode='constant', constant_values=0)
+    starts = np.where(np.diff(padded.astype(int)) == 1)[0]
+    ends = np.where(np.diff(padded.astype(int)) == -1)[0]
+
+    segments = []
+    for start_chunk, end_chunk in zip(starts, ends):
+        start_sample = start_chunk * chunk_size
+        end_sample = end_chunk * chunk_size
+        duration = (end_sample - start_sample) / chunk_size * chunk_duration
+        if duration >= min_segment_duration:
+            segments.append((start_sample, end_sample))
+    return segments
+
+
+@dataclass
+class SegmentInfo:
+    file_path: Path
+    start_sample: int
+    end_sample: int
+    sr: int
+
+
+# ============================================================
+# Dataset: denoise+segment on-the-fly, then log-mel
+# ============================================================
+
+class SegmentedAudioDataset(Dataset):
+    """
+    Dataset that:
+      - Finds all audio files under root_dir.
+      - For each file, runs the denoise+segment logic in memory to find
+        "loud" segments.
+      - Each item is one segment: cropped/padded to fixed duration, then
+        converted to log-mel.
+
+    No intermediate files are written.
+    """
+
     def __init__(
         self,
         root_dir: str,
         sample_rate: int = 16000,
-        duration_sec: float = 10.0,
+        target_duration_sec: float = 10.0,
         n_mels: int = 80,
         n_fft: int = 1024,
         hop_length: int = 256,
         f_min: float = 0.0,
         f_max: float = None,
+        # denoise/segment params (mirror your script)
+        threshold_std: float = 0.25,
+        use_mean: bool = True,
+        chunk_duration: float = 0.05,
+        padding_chunks: int = 5,
+        min_segment_duration: float = 0.3,
     ):
         super().__init__()
-        self.root_dir = root_dir
+        self.root_dir = Path(root_dir)
         self.sample_rate = sample_rate
-        self.target_len = int(sample_rate * duration_sec)
+        self.target_len = int(sample_rate * target_duration_sec)
 
-        self.files: List[str] = sorted(
-            glob.glob(os.path.join(root_dir, "**", "*.wav"), recursive=True)
-        )
-        if len(self.files) == 0:
-            raise RuntimeError(f"No .wav files found under {root_dir}")
-
-        # Transforms to mel-spectrogram then log amplitude
+        # log-mel transforms
         self.mel = MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -57,40 +149,132 @@ class AudioDataset(Dataset):
         )
         self.to_db = AmplitudeToDB(stype="power")
 
-    def __len__(self):
-        return len(self.files)
+        # denoise/segment params
+        self.threshold_std = threshold_std
+        self.use_mean = use_mean
+        self.chunk_duration = chunk_duration
+        self.padding_chunks = padding_chunks
+        self.min_segment_duration = min_segment_duration
 
-    def _load_and_fix_length(self, path: str) -> torch.Tensor:
-        wav, sr = torchaudio.load(path)  # (channels, time)
-        # Convert to mono
+        # build segment index
+        self.segments: List[SegmentInfo] = []
+        self._build_index()
+
+        if len(self.segments) == 0:
+            raise RuntimeError(f"No segments found under {root_dir} with current settings")
+
+        print(f"Indexed {len(self.segments)} segments from audio in {root_dir}")
+
+    def _find_audio_files(self) -> List[Path]:
+        audio_files: List[Path] = []
+        for root, dirs, files in os.walk(self.root_dir):
+            for fname in files:
+                p = Path(root) / fname
+                if p.suffix.lower() in AUDIO_EXTENSIONS:
+                    audio_files.append(p)
+        return sorted(audio_files)
+
+    def _load_mono_resampled(self, path: Path) -> Tuple[np.ndarray, int]:
+        wav, sr = torchaudio.load(str(path))  # (C, T)
         if wav.size(0) > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
-        # Resample if needed
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
-        # Crop or pad
-        if wav.size(1) > self.target_len:
-            wav = wav[:, :self.target_len]
-        elif wav.size(1) < self.target_len:
-            pad_len = self.target_len - wav.size(1)
-            wav = F.pad(wav, (0, pad_len))
+            sr = self.sample_rate
+        audio = wav.squeeze(0).cpu().numpy().astype(np.float32)
+        return audio, sr
+
+    def _build_index(self):
+        print(f"Scanning and segmenting audio under {self.root_dir} ...")
+        files = self._find_audio_files()
+        if not files:
+            raise RuntimeError(f"No audio files found under {self.root_dir}")
+
+        for i, path in enumerate(files, 1):
+            try:
+                audio, sr = self._load_mono_resampled(path)
+                if len(audio) == 0:
+                    continue
+
+                chunk_volumes, chunk_size = calculate_chunk_volumes(
+                    audio, sr, self.chunk_duration
+                )
+                if len(chunk_volumes) == 0:
+                    continue
+
+                threshold = calculate_threshold(
+                    chunk_volumes, self.threshold_std, self.use_mean
+                )
+                chunk_mask = chunk_volumes >= threshold
+                chunk_mask = expand_mask(chunk_mask, self.padding_chunks)
+
+                segs = find_segments(
+                    chunk_mask,
+                    chunk_size,
+                    self.chunk_duration,
+                    self.min_segment_duration,
+                )
+
+                for (start, end) in segs:
+                    end = min(end, len(audio))
+                    if end <= start:
+                        continue
+                    self.segments.append(
+                        SegmentInfo(
+                            file_path=path,
+                            start_sample=int(start),
+                            end_sample=int(end),
+                            sr=sr,
+                        )
+                    )
+
+                if i % 100 == 0 or i == len(files):
+                    print(f"  Processed {i}/{len(files)} files, segments so far: {len(self.segments)}")
+            except Exception as e:
+                print(f"Error processing {path}: {e}")
+
+    def __len__(self):
+        return len(self.segments)
+
+    def _extract_segment_waveform(self, seg: SegmentInfo) -> torch.Tensor:
+        # reload audio for this file (we don't keep full audio in RAM)
+        audio, sr = self._load_mono_resampled(seg.file_path)
+        # safety: ensure sr == self.sample_rate
+        assert sr == self.sample_rate, "Resampling invariant violated"
+
+        start = min(seg.start_sample, len(audio))
+        end = min(seg.end_sample, len(audio))
+        segment = audio[start:end]
+        if len(segment) == 0:
+            # fallback: tiny silence (will be dropped by training eventually)
+            segment = np.zeros(1, dtype=np.float32)
+
+        # crop/pad to fixed target_len
+        if len(segment) > self.target_len:
+            segment = segment[: self.target_len]
+        elif len(segment) < self.target_len:
+            pad_len = self.target_len - len(segment)
+            segment = np.pad(segment, (0, pad_len), mode="constant")
+
+        wav = torch.from_numpy(segment).unsqueeze(0)  # (1, T)
         return wav
 
     def __getitem__(self, idx):
-        path = self.files[idx]
-        wav = self._load_and_fix_length(path)  # (1, T)
+        seg = self.segments[idx]
+        wav = self._extract_segment_waveform(seg)  # (1, T)
+
         with torch.no_grad():
             mel = self.mel(wav)  # (1, n_mels, T_frames)
-            log_mel = self.to_db(mel + 1e-6)  # (1, n_mels, T_frames)
-        # Normalize per-sample (optional; you can also do dataset-wide norm)
+            log_mel = self.to_db(mel + 1e-6)
+        # per-sample normalization
         mean = log_mel.mean()
         std = log_mel.std() + 1e-8
         log_mel = (log_mel - mean) / std
-        return log_mel  # shape (1, n_mels, T_frames)
+        return log_mel  # (1, n_mels, T_frames)
 
 
 # ============================================================
-# VAE Model (Conv encoder/decoder on log-mel)
+# VAE Model (same as before, conv encoder/decoder)
 # ============================================================
 
 class ConvVAE(nn.Module):
@@ -99,13 +283,9 @@ class ConvVAE(nn.Module):
         self.latent_dim = latent_dim
         self.beta = beta
 
-        # Encoder: Conv2d stack, downsample in time & frequency
-        # Input shape: (B, 1, n_mels, T_frames)
         enc_channels = [32, 64, 128, 256]
         self.encoder_convs = nn.ModuleList()
         in_ch = in_channels
-
-        # Each block halves freq and time dimensions (approx) using stride (2,2)
         for out_ch in enc_channels:
             block = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
@@ -115,19 +295,13 @@ class ConvVAE(nn.Module):
             self.encoder_convs.append(block)
             in_ch = out_ch
 
-        # We won't know spatial dims (H, W) until we see data, so we will
-        # compute them in a "lazy" way in forward by caching.
-        self.enc_out_dim = None  # flattened dimension after conv encoder
-
-        # These linear layers will be initialized lazily once enc_out_dim is known
+        self.enc_out_dim = None
         self.fc_mu = None
         self.fc_logvar = None
-
-        # Decoder: linear -> conv transpose stack (mirrors encoder)
         self.decoder_input = None
+
         self.decoder_convs = nn.ModuleList()
         dec_channels = list(reversed(enc_channels))
-
         for i in range(len(dec_channels) - 1):
             in_ch = dec_channels[i]
             out_ch = dec_channels[i + 1]
@@ -145,31 +319,21 @@ class ConvVAE(nn.Module):
             )
             self.decoder_convs.append(block)
 
-        # Final layer back to 1 channel
         self.final_conv = nn.ConvTranspose2d(
             dec_channels[-1], 1, kernel_size=4, stride=2, padding=1
         )
 
     def encode(self, x):
-        """
-        x: (B, 1, H, W)
-        returns: mu, logvar (B, latent_dim)
-        """
-        batch_size = x.size(0)
+        B = x.size(0)
         h = x
         for block in self.encoder_convs:
             h = block(h)
+        h = h.view(B, -1)
 
-        # Flatten
-        h = h.view(batch_size, -1)
-
-        # Lazy init of fc layers if needed
         if self.enc_out_dim is None:
             self.enc_out_dim = h.size(1)
             self.fc_mu = nn.Linear(self.enc_out_dim, self.latent_dim).to(h.device)
             self.fc_logvar = nn.Linear(self.enc_out_dim, self.latent_dim).to(h.device)
-
-            # Decoder input fully-connected: latent -> enc_out_dim
             self.decoder_input = nn.Linear(self.latent_dim, self.enc_out_dim).to(h.device)
 
         mu = self.fc_mu(h)
@@ -182,37 +346,19 @@ class ConvVAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z, target_shape):
-        """
-        z: (B, latent_dim)
-        target_shape: (B, 1, H, W) for final crop (we only need H,W)
-
-        Reverse the encoder operations using ConvTranspose2d stacks.
-        """
         B = z.size(0)
         H, W = target_shape[2], target_shape[3]
-
         h = self.decoder_input(z)
-        # Unflatten according to enc_out_dim and conv stack
-        # We know enc_out_dim = C * H_enc * W_enc
-        # To compute H_enc, W_enc we reuse how many downsamples we did
+
         num_downsamples = len(self.encoder_convs)
-        H_enc = H // (2 ** num_downsamples)
-        W_enc = W // (2 ** num_downsamples)
-        # Safety: avoid zero
-        H_enc = max(1, H_enc)
-        W_enc = max(1, W_enc)
+        H_enc = max(1, H // (2 ** num_downsamples))
+        W_enc = max(1, W // (2 ** num_downsamples))
         C_enc = self.enc_out_dim // (H_enc * W_enc)
 
         h = h.view(B, C_enc, H_enc, W_enc)
-
-        # Apply decoder conv-transpose blocks
         for block in self.decoder_convs:
             h = block(h)
-
         h = self.final_conv(h)
-
-        # h may be slightly larger than target due to stride/padding;
-        # crop to match original H, W
         h = h[:, :, :H, :W]
         return h
 
@@ -223,21 +369,14 @@ class ConvVAE(nn.Module):
         return recon, mu, logvar
 
     def loss_function(self, recon_x, x, mu, logvar):
-        """
-        Beta-VAE loss: recon + beta * KL
-        Recon: L1 loss on log-mel (you can use L2 if preferred).
-        """
         recon_loss = F.l1_loss(recon_x, x, reduction="mean")
-
-        # KL divergence between q(z|x) and N(0,I)
-        # 0.5 * sum(1 + logvar - mu^2 - exp(logvar))
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         loss = recon_loss + self.beta * kl
         return loss, recon_loss, kl
 
 
 # ============================================================
-# Training Loop
+# Training
 # ============================================================
 
 def train(
@@ -252,17 +391,28 @@ def train(
     sample_rate: int = 16000,
     duration_sec: float = 10.0,
     n_mels: int = 80,
+    # denoise/segment params
+    threshold_std: float = 0.25,
+    use_mean: bool = True,
+    chunk_duration: float = 0.05,
+    padding_chunks: int = 5,
+    min_segment_duration: float = 0.3,
 ):
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    dataset = AudioDataset(
+    dataset = SegmentedAudioDataset(
         root_dir=data_dir,
         sample_rate=sample_rate,
-        duration_sec=duration_sec,
+        target_duration_sec=duration_sec,
         n_mels=n_mels,
+        threshold_std=threshold_std,
+        use_mean=use_mean,
+        chunk_duration=chunk_duration,
+        padding_chunks=padding_chunks,
+        min_segment_duration=min_segment_duration,
     )
 
     dataloader = DataLoader(
@@ -274,10 +424,9 @@ def train(
         drop_last=True,
     )
 
-    # Grab one batch to infer input shape
     x0 = next(iter(dataloader))
-    B, C, H, W = x0.shape
     print(f"Example batch shape (log-mel): {x0.shape}")
+    B, C, H, W = x0.shape
 
     model = ConvVAE(in_channels=C, latent_dim=latent_dim, beta=beta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -289,10 +438,10 @@ def train(
         running_loss = 0.0
         running_recon = 0.0
         running_kl = 0.0
+        count = 0
 
         for batch_idx, x in enumerate(dataloader):
             x = x.to(device)
-
             recon, mu, logvar = model(x)
             loss, recon_loss, kl = model.loss_function(recon, x, mu, logvar)
 
@@ -303,25 +452,25 @@ def train(
             running_loss += loss.item()
             running_recon += recon_loss.item()
             running_kl += kl.item()
+            count += 1
             global_step += 1
 
             if (batch_idx + 1) % 100 == 0:
-                avg_loss = running_loss / 100
-                avg_recon = running_recon / 100
-                avg_kl = running_kl / 100
+                avg_loss = running_loss / count
+                avg_recon = running_recon / count
+                avg_kl = running_kl / count
                 print(
                     f"Epoch [{epoch}/{num_epochs}] "
                     f"Step [{batch_idx+1}/{len(dataloader)}] "
                     f"Loss: {avg_loss:.4f} Recon: {avg_recon:.4f} KL: {avg_kl:.4f}"
                 )
                 running_loss = running_recon = running_kl = 0.0
+                count = 0
 
-        # End of epoch logging
-        if len(dataloader) > 0:
-            epoch_loss = running_loss / max(1, len(dataloader) % 100)
-            print(f"End of Epoch {epoch}: last-window loss = {epoch_loss:.4f}")
+        if count > 0:
+            avg_loss = running_loss / count
+            print(f"End of Epoch {epoch}: avg loss over last window = {avg_loss:.4f}")
 
-        # Save checkpoint occasionally
         ckpt_path = f"vae_latent{latent_dim}_epoch{epoch}.pt"
         torch.save(
             {
@@ -341,9 +490,11 @@ def train(
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train ConvVAE on short audio (log-mel).")
+    parser = argparse.ArgumentParser(
+        description="Train ConvVAE on denoised+segmented audio (log-mel)."
+    )
     parser.add_argument("--data_dir", type=str, required=True,
-                        help="Root directory containing .wav files.")
+                        help="Root directory containing raw audio files.")
     parser.add_argument("--latent_dim", type=int, default=128,
                         help="Latent dimension of VAE.")
     parser.add_argument("--batch_size", type=int, default=16)
@@ -354,15 +505,30 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--duration_sec", type=float, default=10.0,
-                        help="Fixed duration for clips (crop/pad).")
+                        help="Fixed duration for segments (crop/pad).")
     parser.add_argument("--n_mels", type=int, default=80)
     parser.add_argument("--device", type=str, default=None,
                         help="'cuda', 'cpu', or None to auto-select.")
+
+    # denoise/segment params (mirroring your script defaults for --segment)
+    parser.add_argument("--threshold_std", type=float, default=0.25,
+                        help="Std multiplier for threshold (std-multiplier).")
+    parser.add_argument("--no_mean", action="store_true",
+                        help="Use std * std-multiplier from zero (no mean).")
+    parser.add_argument("--chunk_duration", type=float, default=0.05,
+                        help="Chunk duration in seconds.")
+    parser.add_argument("--padding_chunks", type=int, default=5,
+                        help="Chunks to keep around loud chunks.")
+    parser.add_argument("--min_segment_duration", type=float, default=0.3,
+                        help="Minimum segment duration (seconds).")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    use_mean = not args.no_mean
+
     train(
         data_dir=args.data_dir,
         latent_dim=args.latent_dim,
@@ -375,6 +541,11 @@ def main():
         sample_rate=args.sample_rate,
         duration_sec=args.duration_sec,
         n_mels=args.n_mels,
+        threshold_std=args.threshold_std,
+        use_mean=use_mean,
+        chunk_duration=args.chunk_duration,
+        padding_chunks=args.padding_chunks,
+        min_segment_duration=args.min_segment_duration,
     )
 
 
